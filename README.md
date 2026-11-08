@@ -12,6 +12,54 @@ state in herdr-core's doc store, so it survives crashes and context resets.
 $hc-orchestrate <task>      # Codex
 ```
 
+```mermaid
+flowchart TB
+    you(["You"]) -->|"/hc-orchestrate &lt;task&gt;"| lead["Lead agent<br/>Claude Code or Codex,<br/>in its own hc terminal"]
+
+    lead -->|"hco spawn<br/>hc send · interrupt"| workers["<b>Workers</b><br/>one hc terminal each<br/>claude · codex"]
+
+    workers -->|"edit files"| wts[("Worktrees<br/>hco/&lt;run&gt;/&lt;name&gt;")]
+    workers -->|"report"| reports["<b>Reports</b><br/>status events<br/>RESULT.md + STATUS<br/>hc send message"]
+
+    reports --> verify["<b>Lead</b><br/>wait · collect · verify"]
+    wts --> verify
+    verify -->|"hco merge"| repo[("Your branch")]
+```
+
+## How herdr-core works
+
+`hc` talks to the **hc core**, a background server that owns every terminal.
+Each terminal runs one program (an agent, a test run, a script). Because the
+core holds the terminal, closing your window doesn't stop the program. Agents
+report their status to the core through an escape sequence (OSC 7501). Anything
+that can reach the core's socket can start, read, message and wait on any
+terminal it owns.
+
+```mermaid
+flowchart TB
+    clients["<b>Clients</b><br/>hc CLI · hc attach<br/>Herdr app"]
+
+    clients <-->|"local socket"| core
+
+    core["<b>hc core</b><br/>background server<br/>terminals · status · events<br/>labels · doc store"]
+
+    core <--> t1["<b>Terminal t1</b><br/>claude<br/>reports status"]
+    core <--> t2["<b>Terminal t2</b><br/>codex<br/>reports status"]
+    core <--> t3["<b>Terminal t3</b><br/>npm test<br/>exit code only"]
+    core <-.->|"hc machine add"| remote["<b>Other machine</b><br/>terminals machine/t7"]
+```
+
+"Reports status" means the agent sends OSC 7501 (working, idle, blocked,
+error). A plain program like a test run only gives an exit code.
+
+What the skill relies on:
+- **Parents and children.** A terminal started from inside another becomes its
+  child and ends with it unless started with `--outlive-parent`.
+- **Status and waiting.** `hc wait` returns on news from the core: a turn ended,
+  blocked, error, exit, or an incoming message.
+- **Messages between agents.** `hc send` types into another terminal. The
+  message is tagged with the sender's address when both sides report OSC 7501.
+
 ## Why hc for this
 
 - **Workers outlive windows.** Each worker runs in an hc terminal that keeps
@@ -38,10 +86,51 @@ $hc-orchestrate <task>      # Codex
 | `templates/hco-claude.md`, `hco-codex.md` | hc templates so core waits for the agent to be ready before handing it the task, and tells the lead if it didn't go in. |
 | `references/` | Orchestration recipes, the verified hc facts the skill depends on, and the doc-store notes behind board mode. |
 
+### How a run flows
+
+```mermaid
+flowchart TD
+    A["<b>0 · Preflight</b><br/>lead inside hc?"] -->|no| X(["Restart the lead<br/>inside hc"])
+    A -->|yes| B{"One agent<br/>enough?"}
+    B -->|yes| S(["Lead does it itself"])
+    B -->|no| P["<b>1 · Plan</b><br/>PLAN.md, one row<br/>per worker"]
+    P --> Q{"You<br/>approve?"}
+    Q -->|edit| P
+    Q -->|yes| C["<b>2 · Spawn</b><br/>hco spawn per worker<br/>writers get a worktree"]
+    C --> D["<b>3 · Supervise</b><br/>hco wait"]
+    D -->|"blocked · stopped · error"| H["Read the screen,<br/>ask you or nudge"]
+    H --> D
+    D -->|"STATUS DONE"| E["<b>4 · Verify</b><br/>collect, tests,<br/>cross-vendor review"]
+    E -->|"fails, max 2 rounds"| F["Send the worker<br/>the concrete error"]
+    F --> D
+    E -->|passes| G["<b>5 · Integrate</b><br/>hco merge"]
+    G --> R["<b>6 · Report</b><br/>done · verified · open"]
+    R --> Z["<b>Clean up</b><br/>hco cleanup"]
+```
+
 Why two report channels: hc only tags agent-to-agent messages when both
 sides speak OSC 7501, and a sandboxed Codex may not be allowed to reach
 hc's socket. The outbox files work regardless, and the lead learns a worker
 stopped from hc's status events either way.
+
+```mermaid
+sequenceDiagram
+    participant L as Lead
+    participant C as hc core
+    participant W as Worker
+    participant O as Outbox (files)
+
+    L->>C: hco spawn (template waits for agent ready)
+    C->>W: first message: BRIEF.md
+    W-->>C: OSC 7501 working
+    Note over W: does the task, inside its scope
+    W->>O: RESULT.md + STATUS=DONE
+    W-->>C: OSC 7501 idle
+    W->>L: hc send "[hco run/name] DONE …" (may be blocked in a Codex sandbox)
+    C-->>L: hco wait returns (status event)
+    L->>O: hco collect: read RESULT.md, diff vs. scope
+    Note over L: the report is a claim: verify before trusting it
+```
 
 ## Board mode: batch jobs on the doc store
 
@@ -63,6 +152,71 @@ after you approve; without it the skill behaves as above.
   docs deleted (their versions are kept), finished worker terminals removed.
 - **Lineage.** A rerun with changed preconditions is a new experiment:
   `init e052 --spec s.json --parent e051 --delta '{"macros":true}'`.
+
+```mermaid
+flowchart TB
+    lead["<b>Lead / you</b>"] -->|"hcboard init<br/>status · pause · resume"| store
+    lead -->|"hc run …<br/>hcboard run"| orch
+
+    store[("<b>hc doc store</b><br/>manifest sk-&lt;exp&gt;<br/>jobs sk-&lt;exp&gt;-jNNN")]
+    orch["<b>Orchestrator</b><br/>&lt;exp&gt;-orch"]
+
+    store -.->|"doc + terminal events"| orch
+    orch -->|"start up to<br/>max_workers"| workers["<b>Workers</b><br/>&lt;exp&gt;-w1, -w2, …"]
+    workers -->|"CAS claim<br/>write result"| store
+    workers -->|"run job_cmd"| out[("runs/&lt;exp&gt;/<br/>&lt;job&gt;.json + .log")]
+    orch -->|"at the end:<br/>export + commit"| exp[("experiments/<br/>&lt;exp&gt;.json")]
+```
+
+Each job doc moves through these states. Every transition is a guarded
+compare-and-set on the doc (`if state/owner/attempt …`), so a stale writer loses
+instead of overwriting newer work. A worker claims a job by setting itself as
+owner. A job goes back to `pending` when `job_cmd` fails with attempts left
+(retry), or when its owner's terminal dies (the orchestrator requeues it). It
+ends `failed` when either happens on the last attempt:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> pending: init
+    pending --> running: claim (CAS)
+    running --> done: exit 0
+    running --> pending: retry or requeue
+    running --> failed: no tries left
+    pending --> failed: exhausted
+    done --> [*]
+    failed --> [*]
+```
+
+The manifest has its own, coarser lifecycle:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> planned: hcboard init
+    planned --> running: hcboard run
+    running --> paused: hcboard pause
+    paused --> running: hcboard resume
+    running --> done: every job done or failed
+    done --> archived: exported + committed, docs deleted
+    archived --> [*]
+```
+
+What the orchestrator does on each event, and how it ends:
+
+```mermaid
+flowchart TD
+    start["<b>hcboard run</b><br/>planned → running"] --> sub["Subscribe to<br/>doc + terminal events"]
+    sub --> loop(["Wait: event<br/>or 30 s tick"])
+    loop -->|"watch died"| sub
+    loop -->|"event · tick"| rec["<b>Reconcile</b><br/>re-read all docs,<br/>requeue orphans,<br/>fail exhausted jobs"]
+    rec --> fin{"All jobs<br/>final?"}
+    fin -->|no| sp["Start workers<br/>up to max_workers"]
+    sp --> loop
+    fin -->|yes| f1["Manifest → done<br/>export + git commit"]
+    f1 --> f2["Manifest → archived<br/>delete docs"]
+    f2 --> f3["Remove finished workers<br/>HCBOARD COMPLETE"]
+```
 
 ```sh
 S=~/.claude/skills/hc-orchestrate/scripts
