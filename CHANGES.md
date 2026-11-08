@@ -3,6 +3,29 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Remote workers (`--on`) live test (hc 0.1.18, omarchy: Linux, Claude 2.1.319, Codex 0.167.0)
+
+### Verified
+- Spawn writes the brief with `hc file write --on`; Claude and Codex start by direct command; the
+  env scrub runs there. Both reported with `hc send` to the lead (`<hc from="omarchy/t20">`), so the
+  brief's lookup of the lead through `parent` works across machines; `hco wait` woke on each.
+- `status`/`collect` read the remote STATUS and RESULT.md; `cleanup` killed and removed the remote
+  terminals.
+- A new remote folder shows Codex's trust prompt (it may not for a folder trusted before);
+  `--trust` can't help remotely, the user accepted it with `hc attach`.
+
+### Found and fixed
+- `collect` had no change check for remote workers (no worktree, no fingerprint), so a remote
+  reviewer changing files went unnoticed. `spawn --on` now runs a helper there over `hc exec`
+  (`REMOTE_PY`, needs `python3`) that snapshots HEAD plus a hash of every uncommitted file;
+  `collect` lists files whose content differs since spawn and flags read-only roles. Files that
+  were already changed before the worker started, and are unchanged by it, are not listed.
+- Remote outboxes were not git-excluded and were left behind after `cleanup`. Spawn now adds the
+  outbox and check artifacts to the remote repo's `.git/info/exclude`; `cleanup` fetches the outbox
+  in one call and deletes it there only after that succeeded (and its empty parent folders).
+- Tests: the fake hc now implements `exec` (base64 JSON like the real one) and `file read|write`;
+  7 new tests in `Remote`.
+
 ## Merge live test (hc 0.1.18, Claude Code 2.1.319)
 
 Throwaway repo; a Claude writer (`hco-claude` template) added a function, a Codex writer

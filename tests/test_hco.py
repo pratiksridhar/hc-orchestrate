@@ -353,6 +353,96 @@ class Merge(Base):
         self.assertNotEqual(self.hco("merge", "--run", run, "--name", "zzz", check=False).returncode, 0)
 
 
+class Remote(Base):
+    """--on workers. The fake hc runs `exec` and `file` locally, so a temp repo stands in for the
+    other machine's checkout."""
+
+    def setUp(self):
+        super().setUp()
+        self.far = Path(self.tmp.name) / "far"
+        self.far.mkdir()
+        for cmd in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            subprocess.run(["git", *cmd], cwd=self.far, check=True, capture_output=True)
+        (self.far / "a.txt").write_text("a\n")
+        (self.far / "keep.txt").write_text("k\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.far, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=self.far, check=True)
+        (self.far / "keep.txt").write_text("dirty before the worker\n")  # pre-existing change: not the worker's
+
+    def spawn_far(self, run, name="w1", role="implement", cwd=None, **kw):
+        return json.loads(self.hco("spawn", "--run", run, "--name", name, "--agent", "claude", "--role", role,
+                                   "--on", "box", "--cwd", str(cwd or self.far), "--brief", self.brief(), **kw).stdout)
+
+    def collect(self, run):
+        return self.hco("collect", "--run", run).stdout
+
+    def test_spawn_excludes_outbox_and_artifacts_there(self):
+        out = self.spawn_far(self.init_run())
+        self.assertEqual(out["warnings"], [])
+        ex = (self.far / ".git/info/exclude").read_text().splitlines()
+        self.assertIn("/.hc-orchestrate/", ex)
+        self.assertIn("__pycache__/", ex)
+        st = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=self.far,
+                            capture_output=True, text=True).stdout
+        self.assertEqual(st.strip(), "M keep.txt")  # the outbox (with BRIEF.md) is not listed
+
+    def test_collect_lists_only_what_changed_since_spawn(self):
+        run = self.init_run()
+        self.spawn_far(run)
+        self.assertIn("since this worker started (by it or another worker there): nothing", self.collect(run))
+        (self.far / "a.txt").write_text("changed\n")
+        (self.far / "new.txt").write_text("n\n")
+        (self.far / "__pycache__").mkdir()
+        (self.far / "__pycache__" / "m.pyc").write_bytes(b"x")
+        out = self.collect(run)
+        self.assertIn("worker there): a.txt, new.txt\n", out)  # not keep.txt, not the .pyc, not the outbox
+
+    def test_collect_sees_commits_and_reverts(self):
+        run = self.init_run()
+        self.spawn_far(run)
+        (self.far / "a.txt").write_text("committed by worker\n")
+        subprocess.run(["git", "commit", "-q", "-am", "w"], cwd=self.far, check=True)
+        out = self.collect(run)
+        # keep.txt's earlier change went into the commit, but its content is what it was at spawn
+        self.assertIn("worker there): a.txt\n", out)
+        subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=self.far, check=True)
+        (self.far / "keep.txt").write_text("dirty before the worker\n")
+        self.assertIn("worker there): nothing", self.collect(run))
+
+    def test_reviewer_that_changes_files_is_flagged(self):
+        run = self.init_run()
+        self.spawn_far(run, "rev", role="review")
+        (self.far / "a.txt").write_text("oops\n")
+        self.assertIn("!! rev is a review worker and files changed", self.collect(run))
+
+    def test_not_a_git_repo_warns(self):
+        plain = Path(self.tmp.name) / "plain"
+        plain.mkdir()
+        out = self.spawn_far(self.init_run(), cwd=plain)
+        self.assertIn("not a git repo", out["warnings"][0])
+
+    def test_cleanup_archives_then_removes_remote_outbox(self):
+        run = self.init_run()
+        out = self.spawn_far(run)
+        outbox = Path(out["brief"]).parent
+        (outbox / "STATUS").write_text("DONE\n")
+        (outbox / "RESULT.md").write_text("# r\n")
+        res = self.hco("cleanup", "--run", run).stdout
+        self.assertIn("archived and removed w1's outbox on box", res)
+        self.assertFalse((self.far / ".hc-orchestrate").exists())  # empty parents removed too
+        arch = self.repo / ".hc-orchestrate" / run / "workers" / "w1"
+        self.assertEqual((arch / "out" / "STATUS").read_text(), "DONE\n")
+        self.assertTrue((arch / "BRIEF.md").is_file())
+
+    def test_cleanup_keeps_remote_outbox_when_unreachable(self):
+        run = self.init_run()
+        out = self.spawn_far(run)
+        (Path(out["brief"]).parent / "STATUS").write_text("DONE\n")
+        res = self.hco("cleanup", "--run", run, env={"FAKE_HC_EXEC_DOWN": "1"}).stdout
+        self.assertIn("kept remote outbox of w1 on box", res)
+        self.assertTrue((Path(out["brief"]).parent / "STATUS").is_file())
+
+
 class Units(unittest.TestCase):
     def test_demote_headings_skips_code_fences(self):
         md = "# Top\ntext\n```\n# not a heading\n```\n## Sub"

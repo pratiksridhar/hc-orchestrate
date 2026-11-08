@@ -91,6 +91,29 @@ def main(argv):
                 res["first_message"] = {"sent": True, "started": True, "turn": 1}
         print(json.dumps(res))
         return
+    elif argv[0] == "exec":  # like real `hc exec --json`; --on is ignored (runs here)
+        import base64
+        import subprocess
+        sep = argv.index("--")
+        if os.environ.get("FAKE_HC_EXEC_DOWN"):
+            err("unreachable", "machine is not connected", 5)
+        stdin = sys.stdin.read() if "-i" in argv[:sep] else None
+        p = subprocess.run(argv[sep + 1:], input=stdin, capture_output=True, text=True)
+        print(json.dumps({"code": p.returncode, "signal": None, "timed_out": False, "truncated": False,
+                          "stdout": base64.b64encode(p.stdout.encode()).decode(),
+                          "stderr": base64.b64encode(p.stderr.encode()).decode()}))
+        return
+    elif argv[0] == "file":  # file read|write [--on M] PATH [--json]; --on is ignored
+        path = [a for i, a in enumerate(argv[2:], 2) if not a.startswith("--") and argv[i - 1] != "--on"][0]
+        if argv[1] == "write":
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").write(sys.stdin.read())
+            print(json.dumps({"path": path}))
+        else:
+            if not os.path.isfile(path):
+                err("not_found", f"no file {path}", 3)
+            sys.stdout.write(open(path).read())
+        return
     elif argv[0] == "wait":
         print(json.dumps({"terminal": None, "ended": False, "reason": "timeout", "children": []}))
     elif argv[0] == "kill":

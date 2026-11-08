@@ -335,7 +335,8 @@ results with "unchanged since this worker started".
   wt/<worker>/                         git worktree, branch hco/<run>/<worker>
   workers/<worker>/BRIEF.md            copy of each brief; outboxes archived here on cleanup
 <worker cwd>/.hc-orchestrate/<run>/out/<worker>/
-  BRIEF.md  RESULT.md  STATUS          the worker's outbox
+  BRIEF.md  RESULT.md  STATUS          the worker's outbox (on another machine with --on:
+                                       git-excluded there too, deleted by cleanup)
 ```
 
 Board mode writes, under the repo you pass as `--cwd`: `runs/<exp>/<job>.json` and `.log`
@@ -345,7 +346,8 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
 
 - Live-tested on hc 0.1.17 (one Claude writer in a worktree plus one Codex reviewer, and a
   single Claude worker) and on hc 0.1.18 (templates, a Claude and a Codex writer in worktrees,
-  `merge`, `cleanup --worktrees`); see CHANGES.md. `--on` is untested.
+  `merge`, `cleanup --worktrees`, and `--on` with Claude and Codex workers on a Linux machine);
+  see CHANGES.md.
 - `merge` commits everything new in a worktree that git doesn't ignore. `init` excludes common
   check artifacts, but anything else a worker leaves behind would be committed: run
   `hco merge --dry-run` first and remove files outside the worker's scope.
@@ -354,8 +356,11 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
 - A brand-new folder (e.g. a fresh worktree) may show the agent's
   folder-trust prompt. The template run then reports the task as not sent;
   the lead asks you to approve it in that terminal.
-- Remote workers (`--on`) use direct commands, not templates, and have had
-  the least checking.
+- Remote workers (`--on`) use direct commands, not templates, and need `python3` on that
+  machine. `hco` snapshots the remote checkout at spawn so `collect` can list what changed
+  (shared with any other worker in that folder; no snapshot if it isn't a git repo), and
+  `cleanup` deletes the remote outbox after archiving it. `--trust` is local only, so a new
+  remote folder's trust prompt must be accepted by you (`hc attach machine/t7`).
 - Board mode (live-tested on hc 0.1.17 in an isolated session, with a fake job): one
   orchestrator per experiment; remote owners (`machine/t7`) are never requeued; workers
   emit no OSC 7501 status (the report format is not in `hc --skill`), they print progress

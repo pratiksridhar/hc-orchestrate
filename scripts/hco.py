@@ -222,6 +222,95 @@ def read_outbox_file(w: dict, fname: str):
     return p.read_text(errors="replace") if p.is_file() else None
 
 
+# Runs on a worker's machine (`--on`) through `hc exec`, with that machine's python3 (the remote
+# brief already needs it). argv: mode cwd [exclude lines...]. Modes:
+#   prep    add the exclude lines to the repo's .git/info/exclude, then print a snapshot
+#   snap    print a snapshot: {"git", "head", "files": {path: blob hash or null}} of uncommitted paths
+#   changed read a snapshot on stdin, print {"changed": [paths whose content differs from it]}
+#   outbox  print {name: text} for the outbox files in cwd (here cwd is the outbox folder)
+#   rmout   delete the outbox folder cwd, then its empty parents up to .hc-orchestrate
+# Paths under .hc-orchestrate/ are never reported.
+REMOTE_PY = r"""
+import json, os, subprocess, sys
+mode, cwd, extra = sys.argv[1], sys.argv[2], sys.argv[3:]
+D = ".hc-orchestrate"
+if mode == "outbox":
+    out = {}
+    for f in ("STATUS", "RESULT.md"):
+        p = os.path.join(cwd, f)
+        if os.path.isfile(p):
+            out[f] = open(p, errors="replace").read()
+    print(json.dumps(out)); sys.exit()
+if mode == "rmout":
+    import shutil
+    if os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(cwd)))) != D:
+        sys.exit("refusing: not an hco outbox")
+    shutil.rmtree(cwd, ignore_errors=True)
+    for p in (os.path.dirname(cwd), os.path.dirname(os.path.dirname(cwd)),
+              os.path.dirname(os.path.dirname(os.path.dirname(cwd)))):
+        try: os.rmdir(p)
+        except OSError: break
+    sys.exit()
+def g(*a):
+    return subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True)
+if g("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+    print(json.dumps({"git": False})); sys.exit()
+if mode == "prep":
+    ex = os.path.join(cwd, g("rev-parse", "--git-common-dir").stdout.strip(), "info", "exclude")
+    os.makedirs(os.path.dirname(ex), exist_ok=True)
+    have = open(ex).read() if os.path.exists(ex) else ""
+    add = [l for l in extra if l not in have.splitlines()]
+    if add:
+        with open(ex, "a") as f:
+            f.write(("" if not have or have.endswith("\n") else "\n")
+                    + "# hc-orchestrate: run folder and check artifacts\n" + "\n".join(add) + "\n")
+def dirty():
+    out = set()
+    for l in g("status", "--porcelain", "--untracked-files=all").stdout.splitlines():
+        out.add(l[3:].split(" -> ")[-1].strip('"'))
+    return {p for p in out if p and not p.startswith(D + "/")}
+def blob(p):
+    full = os.path.join(cwd, p)
+    return g("hash-object", "--", full).stdout.strip() if os.path.isfile(full) else None
+if mode in ("prep", "snap"):
+    head = g("rev-parse", "HEAD").stdout.strip() or None
+    print(json.dumps({"git": True, "head": head, "files": {p: blob(p) for p in sorted(dirty())}})); sys.exit()
+if mode == "changed":
+    start = json.load(sys.stdin)
+    paths = dirty() | set(start["files"])
+    if start.get("head"):
+        paths |= set(g("diff", "--name-only", start["head"], "HEAD").stdout.split())
+    changed = []
+    for p in sorted(x for x in paths if not x.startswith(D + "/")):
+        if p in start["files"]:
+            before = start["files"][p]
+        else:
+            r = g("rev-parse", "--verify", "-q", start["head"] + ":" + p) if start.get("head") else None
+            before = r.stdout.strip() if r is not None and r.returncode == 0 else None
+        if blob(p) != before:
+            changed.append(p)
+    print(json.dumps({"changed": changed}))
+"""
+
+
+def remote_py(machine: str, mode: str, cwd: str, *extra, stdin=None):
+    """Run REMOTE_PY on `machine`; its parsed JSON output, or raise HcError."""
+    args = ["exec", "--json", "--on", machine, "--timeout", "60"] + (["-i"] if stdin is not None else [])
+    try:
+        res = hc_json(args + ["--", "python3", "-c", REMOTE_PY, mode, cwd, *extra], input_text=stdin, timeout=90)
+    except HcError as e:  # re-raise without the script text in the message
+        raise HcError(["exec", "--on", machine, mode], e.code, e.kind, e.message, e.hint) from None
+    except subprocess.TimeoutExpired:
+        raise HcError(["exec", "--on", machine, mode], 1, "timeout", "no answer in 90 s") from None
+    import base64
+
+    out = base64.b64decode(res.get("stdout") or "").decode(errors="replace")
+    if res.get("code") != 0:
+        err = base64.b64decode(res.get("stderr") or "").decode(errors="replace").strip()
+        raise HcError(["exec", mode], res.get("code") or 1, raw=err or out or "remote helper failed")
+    return json.loads(out) if out.strip() else {}
+
+
 def policy_text(root: Path) -> str:
     parts = []
     for p in (config_home() / "hc-orchestrate" / "policy.md", root / PROJECT_POLICY):
@@ -461,11 +550,20 @@ def cmd_spawn(a):
     if not task.strip():
         die(f"brief file {a.brief} is empty")
 
-    warnings, branch, base_sha = [], None, None
+    warnings, branch, base_sha, remote_git = [], None, None, None
     if a.on:
         if not a.cwd or a.worktree:
             die("--on needs --cwd (an absolute path on that machine) and does not support --worktree")
         cwd = a.cwd.rstrip("/")
+        # Exclude the outbox and check artifacts there too, and snapshot the checkout so `collect`
+        # can list what this worker changed (there is no worktree to diff on another machine).
+        try:
+            remote_git = remote_py(a.on, "prep", cwd, f"/{DIRNAME}/", *ARTIFACT_EXCLUDES)
+            if not remote_git.get("git"):
+                remote_git = None
+                warnings.append(f"{cwd} on {a.on} is not a git repo: collect can't list this worker's changes")
+        except HcError as e:
+            warnings.append(f"could not snapshot {cwd} on {a.on} ({e.message}); collect can't list its changes")
     elif a.worktree:
         if not repo_root(root):
             die("--worktree needs the run root to be a git repo")
@@ -542,6 +640,7 @@ def cmd_spawn(a):
         "permissions": a.permissions, "scrub": not a.no_scrub, "cwd": cwd, "outbox": outbox, "on": a.on, "worktree": cwd if branch else None,
         "branch": branch, "base": base_sha, "spawned": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "fingerprint": None if (a.on or branch) else fingerprint(cwd),
+        "remote_git": remote_git,
     }
     write_json(rundir / "run.json", data)
     code = 0
@@ -682,6 +781,17 @@ def cmd_collect(a):
                   "CHANGED since this worker started (by it or by another worker there)"))
             if not same and w["role"] in READ_ONLY_ROLES:
                 print(f"!! {name} is a {w['role']} worker and its checkout changed: check git status there")
+        elif w.get("remote_git"):
+            try:
+                files = remote_py(w["on"], "changed", w["cwd"], stdin=json.dumps(w["remote_git"]))["changed"]
+                print(f"changed in {w['on']}:{w['cwd']} since this worker started (by it or another worker "
+                      f"there): {', '.join(files) if files else 'nothing'}")
+                if files and w["role"] in READ_ONLY_ROLES:
+                    print(f"!! {name} is a {w['role']} worker and files changed in its checkout")
+            except HcError as e:
+                print(f"could not check changes on {w['on']}: {e.message}")
+        elif w.get("on"):
+            print(f"changes on {w['on']} not tracked (no git snapshot at spawn): check git status there")
         print(f"RESULT.md: {w['outbox']}/RESULT.md")
         if result:
             lines = result.splitlines()
@@ -745,22 +855,35 @@ def cmd_merge(a):
 
 
 def archive_outbox(rundir: Path, name: str, w: dict):
+    """Copy the worker's outbox into the run folder. A remote outbox is then deleted on its machine
+    (so it is never left in that repo), but only after its files were fetched in one successful call.
+    Returns a note for the user, or None."""
     dest = rundir / "workers" / name / "out"
     dest.mkdir(parents=True, exist_ok=True)
     if w.get("on"):
-        for f in ("STATUS", "RESULT.md"):
-            text = read_outbox_file(w, f)
-            if text is not None:
-                (dest / f).write_text(text)
+        try:
+            files = remote_py(w["on"], "outbox", w["outbox"])
+        except HcError as e:
+            return f"kept remote outbox of {name} on {w['on']} (could not fetch it: {e.message})"
+        for f, text in files.items():
+            (dest / f).write_text(text)
+        try:
+            remote_py(w["on"], "rmout", w["outbox"])
+        except HcError as e:
+            return f"archived {name}'s remote outbox but could not delete it on {w['on']}: {e.message}"
+        return f"archived and removed {name}'s outbox on {w['on']}"
     elif Path(w["outbox"]).is_dir():
         shutil.copytree(w["outbox"], dest, dirs_exist_ok=True)
+    return None
 
 
 def cmd_cleanup(a):
     rundir, data = load_run(a.run)
     root = Path(data["root"])
     for name, w in data["workers"].items():
-        archive_outbox(rundir, name, w)
+        note = archive_outbox(rundir, name, w)
+        if note:
+            print(note)
     print(f"archived outboxes to {rundir / 'workers'}")
     for t in terminals_for(data["run"]):
         addr = t.get("address") or t.get("name")

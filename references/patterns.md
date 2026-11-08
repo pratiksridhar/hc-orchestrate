@@ -113,6 +113,15 @@ hco spawn --run k3x9 --name perf --agent claude --role test \
   resolve there too, so `--on` uses the direct command, not a template.
 - The worker reaches you via the `parent` that `hc get $HC_TERMINAL_ID` shows
   on its side; its brief says so.
+- That machine needs `python3`. At spawn, `hco` runs a small helper there over `hc exec`: it
+  adds the outbox and check artifacts to the repo's `.git/info/exclude` and snapshots the
+  checkout. `collect` then lists the files whose content changed since the worker started
+  (other workers in the same folder count too) and flags a reviewer that changed any.
+  Not a git repo: spawn warns and changes aren't tracked.
+- `cleanup` fetches the outbox in one call, then deletes it on that machine; if the machine
+  can't be reached it keeps it and says so.
+- A new folder shows the agent's trust prompt there, and `--trust` can't pre-accept it
+  remotely: the user accepts it with `hc attach machine/t7`.
 
 ## 7. Human gate — commands only a person may run
 

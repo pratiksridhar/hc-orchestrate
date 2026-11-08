@@ -167,6 +167,7 @@ Then, once they have what they need:
 
 ```sh
 hco cleanup --run <run>              # kill + rm this run's terminals, archive outboxes
+                                     # (remote ones are then deleted on their machine)
 hco cleanup --run <run> --worktrees  # also remove clean, merged worktrees
 ```
 Branches are kept. If the user wants to inspect a worker, leave its terminal.

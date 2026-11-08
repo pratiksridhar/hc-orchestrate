@@ -128,6 +128,11 @@ If your hc is newer and disagrees, `hc --skill` and `hc <cmd> --help` win.
 - `hc machine add user@host --name box`; `hc run --on box --cwd /abs/path ...`.
 - `hc exec --on box -- <cmd>` runs one command without a terminal (exact
   output and exit code). `hc file read|write|edit --on box <path>`.
+- `hc exec --json` prints `{code, signal, timed_out, truncated, stdout, stderr}` with stdout and
+  stderr **base64-encoded**, and exits 0 even when the program failed: read `code`. `-i` feeds
+  stdin; `--timeout` defaults to 60 s (max 600). No shell: wrap in `sh -c` if you need one.
+  (Verified on hc 0.1.18.)
+- `hc ls` has no `--on`; to list another machine's terminals, `hc exec --on box -- hc ls --json`.
 - A remote child's parent is recorded as `<what that machine calls you>/t7`;
   the child sees it with `hc get $HC_TERMINAL_ID`.
 
