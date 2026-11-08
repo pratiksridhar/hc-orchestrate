@@ -13,14 +13,15 @@ merge work and more things to verify.
 Use when the task splits along file or module boundaries with no shared files.
 
 ```sh
-hco spawn --run k3x9 --name api  --agent claude --role implement --worktree --brief api.md
-hco spawn --run k3x9 --name ui   --agent claude --role implement --worktree --brief ui.md
-hco spawn --run k3x9 --name docs --agent codex  --role implement --worktree --brief docs.md
+hco spawn --run k3x9 --name api  --agent claude --role implement --worktree --scope 'src/api/**' --brief api.md
+hco spawn --run k3x9 --name ui   --agent claude --role implement --worktree --scope 'src/ui/**' --brief ui.md
+hco spawn --run k3x9 --name docs --agent codex  --role implement --worktree --scope 'docs/' --brief docs.md
 hco wait  --run k3x9 --timeout 100      # repeat until all STATUS are DONE
-hco collect --run k3x9
+hco collect --run k3x9                  # flags files outside each worker's --scope
 ```
 
-- Partition scope by path before spawning; write it into each brief.
+- Partition scope by path before spawning and pass it as `--scope`; patterns that
+  don't overlap mean no two writers can touch the same file without `collect` saying so.
 - Shared types or interfaces: define them yourself first (or in a first,
   single worker), commit, then fan out from that commit (`--base <ref>`).
 - Integrate in an order where each merge still builds and passes tests.
@@ -116,7 +117,8 @@ hco spawn --run k3x9 --name perf --agent claude --role test \
 - That machine needs `python3`. At spawn, `hco` runs a small helper there over `hc exec`: it
   adds the outbox and check artifacts to the repo's `.git/info/exclude` and snapshots the
   checkout. `collect` then lists the files whose content changed since the worker started
-  (other workers in the same folder count too) and flags a reviewer that changed any.
+  (other workers in the same folder count too), checks them against `--scope` and flags a
+  reviewer that changed any. (A local worker without `--worktree` gets the same snapshot.)
   Not a git repo: spawn warns and changes aren't tracked.
 - `cleanup` fetches the outbox in one call, then deletes it on that machine; if the machine
   can't be reached it keeps it and says so.
@@ -171,3 +173,9 @@ Refactors outside auth; dependency upgrades.
 
 Briefs fail most often by being vague about scope or about "done". If you
 can't write "Done means" as a check, the unit is not ready to delegate.
+
+Pass the same "May change" patterns to `hco spawn --scope` (here
+`--scope 'src/auth/**' 'tests/auth/**'`). `spawn` then lists them in the worker's rules
+with the instruction to report `BLOCKED: needs <path> (outside my scope)` rather than
+stray, and `collect`/`merge` check the worker's actual files against them. A task that
+needs a lockfile, a shared config or a test fixture should name it in the scope up front.

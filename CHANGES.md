@@ -3,6 +3,53 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Scope check (`--scope`) — live test on hc 0.1.18, Claude Code worker
+
+A writer's scope used to be prose in PLAN.md and its brief; `merge --dry-run` listed the files and
+the lead had to spot strays. Now it is data that `collect` and `merge` check.
+
+### Added
+- `spawn --scope PATTERN...` (repeatable): the files a writer may change, relative to its repo root.
+  Like `.gitignore` but always anchored: `*`/`?` stay in one folder, `**` spans folders, `[...]` is a
+  class, a folder covers everything under it, and a literal path always matches itself (so
+  `app/[id]/page.tsx` needs no escaping). Stored in `run.json`, listed in the brief's rules with
+  "report `BLOCKED: needs <path> (outside my scope)`". Rejected for review/research roles; absolute
+  paths, `..` and empty patterns are refused before anything starts. A writer without `--scope` gets
+  a spawn warning and is not checked (old behavior).
+- `collect`: `scope ok (...)` or `!! <name> changed files outside its scope (...): <files>`.
+- `merge`: refuses (exit 1) before committing or merging anything when any pending worker has a file
+  outside its scope; `--dry-run` marks those files `!!`; `--ignore-scope` merges anyway and says so.
+- `hco scope --run R --name N [--add PATTERN...]`: show or widen one worker's scope, and print the
+  `hc send` go-ahead for it.
+- Workers in a shared local checkout (no `--worktree`) now get the same file-level snapshot as
+  remote ones, so `collect` lists their files and checks scope (it used to say only "CHANGED").
+
+### Found and fixed on the way
+- Renames hid the old path: git's rename detection listed only `src/new.py` for a move out of
+  `legacy/old.py`, so a deletion outside the scope went unseen. File lists now use
+  `--no-renames` (worktree diff, worktree status and the checkout helper).
+- Non-ASCII names came back C-quoted (`"docs/na\303\257ve.md"`) and never matched; lists now
+  use `-z`.
+- The checkout helper (`CHECKOUT_PY`, formerly `REMOTE_PY`) ran git in `--cwd` but joined paths to
+  it, which broke for a `--cwd` below the repo top; it now works from the top, and skips any
+  `.hc-orchestrate/` folder (an outbox in a subfolder was listed as a change).
+- Old `run.json` files (`remote_git`, `fingerprint`) still collect.
+
+### Verified live
+Throwaway repo, one Claude worker (`hco-claude` template, worktree, `--trust`, `--scope 'src/**'`), task:
+add `mul` to `src/calc.py` and a test in `tests/test_calc.py`.
+- The brief rendered the scope; the worker did the in-scope part, left `tests/` alone and reported
+  `BLOCKED: needs tests/test_calc.py (outside my scope)`; `collect`: `scope ok (src/**)`.
+- `hco scope --add tests/test_calc.py` + the printed `hc send`: the worker finished, `DONE`;
+  both tests passed in an hc terminal.
+- A stray `notes.tmp` planted in the worktree: dry run marked it, `merge` refused with exit 1 and HEAD
+  unchanged; after removing it `merge` committed and merged only the two scoped files.
+- Not live-tested: Codex workers and `--on` workers with `--scope` (covered by the fake-hc tests).
+
+### Tests
+19 new in `test_hco.py` (`Scope`, `Units`, `Remote`), 58 there in total. Mutation-checked: putting
+rename detection back fails the rename test; disabling the refusal fails the merge test.
+
 ## Remote workers (`--on`) live test (hc 0.1.18, omarchy: Linux, Claude 2.1.319, Codex 0.167.0)
 
 ### Verified

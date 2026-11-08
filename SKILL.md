@@ -34,7 +34,8 @@ file's folder; in Claude Code `${CLAUDE_SKILL_DIR}`).
    you use `hc wait`, not `sleep` or a long shell call.
 6. Workers start with permissions **bypassed** (Claude `--dangerously-skip-permissions`,
    Codex `--dangerously-bypass-approvals-and-sandbox`): nothing but the brief
-   confines them. Pass `--permissions safe` to `hco spawn` for any worker whose
+   confines them (`--scope` catches stray repo files afterwards; it prevents nothing).
+   Pass `--permissions safe` to `hco spawn` for any worker whose
    task is risky or touches systems the policy restricts; never remove a safety
    rule from a brief because "bypass" would let it through. Spawn scrubs secret-looking env vars (`--no-scrub` to opt out), but
    workers can still read files you can read.
@@ -60,8 +61,8 @@ long-running process watched.
 
 Write `.hc-orchestrate/<run>/PLAN.md` (after `init`) with one row per worker:
 name (`a-z0-9-_`, `<run>-<name>` ≤ 32 chars), agent (`claude`|`codex`), role
-(implement · review · research · test · fix), **scope** (exact files it may
-change; no two writers share a file), isolation (`--worktree` for any writer
+(implement · review · research · test · fix), **scope** (path patterns it may
+change, which become its `--scope`; no two writers share a file), isolation (`--worktree` for any writer
 running alongside another writer), deliverable plus the check that proves it,
 and dependencies.
 
@@ -83,11 +84,15 @@ acceptance check, what RESULT.md must contain; paths, not pasted files; see the
 brief guide in `references/patterns.md`) then:
 
 ```sh
-hco spawn --run <run> --name api --agent claude --role implement --worktree --brief api-task.md
+hco spawn --run <run> --name api --agent claude --role implement --worktree \
+  --scope 'src/api/**' 'tests/api/**' --brief api-task.md
 ```
 
 `spawn` wraps the body in the worker contract (scope, no sub-agents, report
-protocol, policy). Read its JSON after each spawn:
+protocol, policy). Give every writer `--scope`: patterns relative to the repo root
+(`*` stays inside a folder, `**` spans folders, a folder covers everything under it).
+They go into the brief; `collect` flags any other changed file and `merge` refuses it.
+Reviewers and researchers take none. Read its JSON after each spawn:
 - `first_message.sent: false` (exit 3): the task did **not** go in. `hc read <t>`;
   usually a trust or login dialog for the user. Then
   `hc send <t> "Read <BRIEF.md> and follow it."` Never resend blindly.
@@ -128,14 +133,18 @@ reports reach you as STATUS/RESULT.md files plus hc's status events, not as mess
 ## 4. Verify (never skip)
 
 `hco collect --run <run>`, then check each claim yourself:
-- Read RESULT.md. Files changed outside the worker's scope are a defect, even if
-  helpful. Reviewers must not change files; `collect` flags it.
+- Read RESULT.md. `collect` flags files changed outside a worker's `--scope`
+  (`!! <name> changed files outside its scope`) and any change by a reviewer: a
+  defect, even if helpful. `scope: none set` means you check the list yourself.
+  A worker that reports `BLOCKED: needs <path> (outside my scope)`: give the file to
+  another worker, or widen this one (`hco scope --run <run> --name <n> --add <path>`
+  prints the `hc send` go-ahead to use).
 - Run tests/builds in hc, not your shell:
   `hc run --bg --rm --no-notify --name <run>-test --cwd <dir> -- <cmd>`, then
   `hc wait <run>-test --timeout 100` and `hc read <run>-test --lines 60`
   (drop `--rm` to read after exit).
-- For important changes add a cross-vendor reviewer (role `review`, scope = the
-  diff) before accepting.
+- For important changes add a cross-vendor reviewer (role `review`, pointed at
+  the diff) before accepting.
 - On failure send the worker the concrete error; at most 2 rounds per worker,
   then report it to the user.
 
@@ -147,8 +156,10 @@ Workers don't commit. After phase 4 passes, in dependency order:
 hco merge --run <run> --dry-run                    # first: the files each worker would commit
 hco merge --run <run> --name api [--name ui ...]   # omit --name for all, in spawn order
 ```
-Every file in the dry run must be in that worker's scope; anything else (a stray
-artifact, a scratch file) is removed from the worktree before merging. `init`
+The dry run marks files outside a worker's scope (`!!`), and the real merge refuses
+them: exit 1 before anything is committed or merged. Remove a stray file (an
+artifact, a scratch file) from the worktree; if it belongs in the change, widen the
+scope with `hco scope --add` or pass `--ignore-scope` and say why in your report. `init`
 already keeps common check artifacts (`__pycache__/`, `*.pyc`, `.pytest_cache/`,
 `node_modules/`, `.DS_Store`, …) out via `.git/info/exclude`.
 For each worker it commits the worktree's changes as `hco <run>/<name>`, then

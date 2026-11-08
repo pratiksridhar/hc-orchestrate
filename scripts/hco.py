@@ -6,12 +6,13 @@ brief layout, report protocol and cleanup every time.
 
   preflight                      check hc, the lead's own terminal, agents, templates
   init    --task T               create a run (id + folder)
-  spawn   --run R --name N ...   start one worker with a brief
+  spawn   --run R --name N ...   start one worker with a brief (--scope: the files it may change)
   wait    --run R                hc wait --children any, then a status table
   status  --run R                status table (hc state + each outbox STATUS)
-  collect --run R                each worker's STATUS, RESULT.md and changed files
+  collect --run R                each worker's STATUS, RESULT.md and changed files, checked against its scope
+  scope   --run R --name N       show a worker's scope; --add PATTERN... widens it
   merge   --run R [--name N]...  commit worktree workers' changes, merge their branches one by one
-                                 (--dry-run lists what would be committed)
+                                 (--dry-run lists what would be committed; refuses out-of-scope files)
   cleanup --run R                kill + rm the run's terminals (archives outboxes)
 
 Python 3.8+, standard library only. HCO_HC overrides the hc binary (tests).
@@ -63,6 +64,8 @@ READ_ONLY_ROLES = {"review", "research"}
 # source; build/ and dist/ are left out on purpose.
 ARTIFACT_EXCLUDES = ("__pycache__/", "*.py[cod]", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
                      ".coverage", ".coverage.*", "node_modules/", ".DS_Store")
+SCOPE_HELP = ("`*` stays inside one folder, `**` spans folders, `[abc]` is a character class, and a folder "
+              "covers everything under it")
 
 
 # ---------------------------------------------------------------- utilities
@@ -210,6 +213,100 @@ def first_line(text: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- scope
+# A writer's scope is a list of path patterns relative to its repo root (the same frame as git's own
+# paths). Matching is like .gitignore but always anchored: `*` and `?` stay inside one path segment,
+# `**` as a whole segment spans any number of them, `[...]` is a character class (`[!...]` negated), and
+# a pattern also covers everything under a folder it matches. A path that equals a pattern literally
+# (or sits under it) matches too, so names with brackets such as `app/[id]/page.tsx` need no escaping.
+
+
+def _segment_rx(seg: str) -> str:
+    rx, i = "", 0
+    while i < len(seg):
+        c = seg[i]
+        if c == "*":
+            rx += "[^/]*"
+        elif c == "?":
+            rx += "[^/]"
+        elif c == "[":
+            start = i + 1 + (seg[i + 1:i + 2] in ("!", "^"))
+            j = seg.find("]", start + 1)  # a ']' right after '[' or '[!' belongs to the class
+            if j == -1:
+                rx += re.escape(c)
+            else:
+                body = "".join(ch if ch == "-" else re.escape(ch) for ch in seg[start:j])
+                rx += ("[^/" if start > i + 1 else "[") + body + "]"
+                i = j
+        else:
+            rx += re.escape(c)
+        i += 1
+    return rx
+
+
+_SCOPE_RX = {}
+
+
+def scope_regex(pattern: str):
+    if pattern not in _SCOPE_RX:
+        segs, rx = pattern.rstrip("/").split("/"), ""
+        for k, seg in enumerate(segs):
+            last = k == len(segs) - 1
+            if seg == "**":
+                rx += ".*" if last else "(?:.*/)?"
+            else:
+                rx += _segment_rx(seg) + ("" if last else "/")
+        _SCOPE_RX[pattern] = re.compile(f"(?:{rx})(?:/.*)?", re.S)
+    return _SCOPE_RX[pattern]
+
+
+def in_scope(path: str, patterns) -> bool:
+    for p in patterns:
+        base = p.rstrip("/")
+        if path == base or path.startswith(base + "/") or scope_regex(p).fullmatch(path):
+            return True
+    return False
+
+
+def out_of_scope(files, patterns):
+    """The files no pattern covers; [] when the worker has no scope (nothing to check against)."""
+    return [f for f in files if not in_scope(f, patterns)] if patterns else []
+
+
+def normalize_scope(patterns):
+    out = []
+    for raw in patterns or []:
+        p = raw.strip()
+        while p.startswith("./"):
+            p = p[2:]
+        if not p or p in (".", "/"):
+            die(f"--scope {raw!r} is empty; to allow every file use '**'")
+        if p.startswith("/"):
+            die(f"--scope {raw!r}: use a path relative to the repo root, e.g. src/auth/**")
+        if ".." in p.split("/"):
+            die(f"--scope {raw!r}: '..' is not allowed")
+        try:
+            scope_regex(p)
+        except re.error as e:
+            die(f"--scope {raw!r} is not a valid pattern: {e}")
+        out.append(p)
+    return out
+
+
+def git_paths(out: str):
+    """Paths from git's -z output (`diff --name-only -z`); unquoted, so any file name survives."""
+    return [p for p in out.split("\0") if p]
+
+
+def status_paths(out: str):
+    """Paths from `git status --porcelain -z --no-renames`: every entry is 'XY path'."""
+    return [e[3:] for e in out.split("\0") if len(e) > 3]
+
+
+def in_outbox_dir(path: str) -> bool:
+    return f"/{DIRNAME}/" in "/" + path
+
+
 def read_outbox_file(w: dict, fname: str):
     """Text of a file in a worker's outbox, here or on its machine; None if absent."""
     path = f"{w['outbox']}/{fname}"
@@ -222,15 +319,17 @@ def read_outbox_file(w: dict, fname: str):
     return p.read_text(errors="replace") if p.is_file() else None
 
 
-# Runs on a worker's machine (`--on`) through `hc exec`, with that machine's python3 (the remote
-# brief already needs it). argv: mode cwd [exclude lines...]. Modes:
+# Checkout helper for workers without a worktree: on a worker's machine (`--on`) through `hc exec`
+# with that machine's python3 (the remote brief already needs it), or here for a worker in a shared
+# local checkout. argv: mode cwd [exclude lines...]. Modes:
 #   prep    add the exclude lines to the repo's .git/info/exclude, then print a snapshot
-#   snap    print a snapshot: {"git", "head", "files": {path: blob hash or null}} of uncommitted paths
+#   snap    print a snapshot: {"git", "top", "head", "files": {path: blob hash or null}} of uncommitted
+#           paths (paths relative to the repo top, like git's own, whatever folder cwd is)
 #   changed read a snapshot on stdin, print {"changed": [paths whose content differs from it]}
 #   outbox  print {name: text} for the outbox files in cwd (here cwd is the outbox folder)
 #   rmout   delete the outbox folder cwd, then its empty parents up to .hc-orchestrate
-# Paths under .hc-orchestrate/ are never reported.
-REMOTE_PY = r"""
+# Paths inside any .hc-orchestrate/ folder (outboxes) are never reported.
+CHECKOUT_PY = r"""
 import json, os, subprocess, sys
 mode, cwd, extra = sys.argv[1], sys.argv[2], sys.argv[3:]
 D = ".hc-orchestrate"
@@ -255,6 +354,9 @@ def g(*a):
     return subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True)
 if g("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
     print(json.dumps({"git": False})); sys.exit()
+cwd = g("rev-parse", "--show-toplevel").stdout.strip() or cwd  # git paths are relative to the top
+def skip(p):
+    return not p or ("/" + D + "/") in ("/" + p)
 if mode == "prep":
     ex = os.path.join(cwd, g("rev-parse", "--git-common-dir").stdout.strip(), "info", "exclude")
     os.makedirs(os.path.dirname(ex), exist_ok=True)
@@ -264,24 +366,23 @@ if mode == "prep":
         with open(ex, "a") as f:
             f.write(("" if not have or have.endswith("\n") else "\n")
                     + "# hc-orchestrate: run folder and check artifacts\n" + "\n".join(add) + "\n")
-def dirty():
-    out = set()
-    for l in g("status", "--porcelain", "--untracked-files=all").stdout.splitlines():
-        out.add(l[3:].split(" -> ")[-1].strip('"'))
-    return {p for p in out if p and not p.startswith(D + "/")}
+def dirty():  # -z: unquoted names; --no-renames: a rename lists its old path too
+    out = g("status", "--porcelain", "-z", "--no-renames", "--untracked-files=all").stdout
+    return {e[3:] for e in out.split("\0") if not skip(e[3:])}
 def blob(p):
     full = os.path.join(cwd, p)
     return g("hash-object", "--", full).stdout.strip() if os.path.isfile(full) else None
 if mode in ("prep", "snap"):
     head = g("rev-parse", "HEAD").stdout.strip() or None
-    print(json.dumps({"git": True, "head": head, "files": {p: blob(p) for p in sorted(dirty())}})); sys.exit()
+    print(json.dumps({"git": True, "top": cwd, "head": head, "files": {p: blob(p) for p in sorted(dirty())}}))
+    sys.exit()
 if mode == "changed":
     start = json.load(sys.stdin)
     paths = dirty() | set(start["files"])
     if start.get("head"):
-        paths |= set(g("diff", "--name-only", start["head"], "HEAD").stdout.split())
+        paths |= set(g("diff", "--name-only", "-z", "--no-renames", start["head"], "HEAD").stdout.split("\0"))
     changed = []
-    for p in sorted(x for x in paths if not x.startswith(D + "/")):
+    for p in sorted(x for x in paths if not skip(x)):
         if p in start["files"]:
             before = start["files"][p]
         else:
@@ -293,11 +394,20 @@ if mode == "changed":
 """
 
 
-def remote_py(machine: str, mode: str, cwd: str, *extra, stdin=None):
-    """Run REMOTE_PY on `machine`; its parsed JSON output, or raise HcError."""
+def checkout_py(machine, mode: str, cwd: str, *extra, stdin=None):
+    """Run CHECKOUT_PY here (machine None) or on `machine`; its parsed JSON output, or raise HcError."""
+    if machine is None:
+        try:
+            p = subprocess.run([sys.executable, "-I", "-c", CHECKOUT_PY, mode, cwd, *extra], input=stdin,
+                               capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            raise HcError(["helper", mode], 1, "timeout", "no answer in 90 s") from None
+        if p.returncode != 0:
+            raise HcError(["helper", mode], p.returncode, raw=p.stderr.strip() or "checkout helper failed")
+        return json.loads(p.stdout) if p.stdout.strip() else {}
     args = ["exec", "--json", "--on", machine, "--timeout", "60"] + (["-i"] if stdin is not None else [])
     try:
-        res = hc_json(args + ["--", "python3", "-c", REMOTE_PY, mode, cwd, *extra], input_text=stdin, timeout=90)
+        res = hc_json(args + ["--", "python3", "-c", CHECKOUT_PY, mode, cwd, *extra], input_text=stdin, timeout=90)
     except HcError as e:  # re-raise without the script text in the message
         raise HcError(["exec", "--on", machine, mode], e.code, e.kind, e.message, e.hint) from None
     except subprocess.TimeoutExpired:
@@ -478,7 +588,7 @@ def demote_headings(md: str, top: int = 3) -> str:
     return "\n".join(("#" * shift + line) if is_heading else line for line, is_heading in zip(lines, marks))
 
 
-def compose_brief(run, name, role, task, lead, cwd, outbox, remote, policy):
+def compose_brief(run, name, role, task, lead, cwd, outbox, remote, policy, scope=None, top=None):
     if remote:
         notify = (f'hc send "$(hc get "$HC_TERMINAL_ID" --json | python3 -c \'import json,sys;'
                   f'print(json.load(sys.stdin)["parent"])\')" "[hco {run}/{name}] <STATUS line> - '
@@ -487,9 +597,18 @@ def compose_brief(run, name, role, task, lead, cwd, outbox, remote, policy):
     else:
         notify = f'hc send {lead} "[hco {run}/{name}] <STATUS line> - {outbox}/RESULT.md"'
         where = f"Your lead is the hc terminal `{lead}`."
-    read_only = role in READ_ONLY_ROLES
-    scope_line = ("You are **read-only**: do not change any file except the two in your outbox."
-                  if read_only else "Change only what the Scope section of your task allows.")
+    if role in READ_ONLY_ROLES:
+        scope_line = "You are **read-only**: do not change any file except the two in your outbox."
+    elif scope:
+        pats = "\n".join(f"  - `{p}`" for p in scope)
+        scope_line = (f"Change only files matching these patterns, relative to `{top or cwd}` ({SCOPE_HELP}):\n"
+                      f"{pats}\n"
+                      "  Your lead's tools check this: any other file you create, change or delete (your outbox "
+                      "aside) is flagged and blocks the merge, so delete scratch files and build output you "
+                      "leave elsewhere. If the task needs a file outside these, stop and report "
+                      "`BLOCKED: needs <path> (outside my scope)`.")
+    else:
+        scope_line = "Change only what the Scope section of your task allows."
     return f"""# Brief: run {run}, worker {name} ({role})
 
 You were started by a lead agent through herdr-core (hc). {where}
@@ -549,8 +668,12 @@ def cmd_spawn(a):
     task = Path(a.brief).read_text()
     if not task.strip():
         die(f"brief file {a.brief} is empty")
+    scope = normalize_scope(a.scope)
+    if scope and a.role in READ_ONLY_ROLES:
+        die(f"--scope lists the files a worker may change; a {a.role} worker may change none. "
+            "Put what it should look at in its brief.")
 
-    warnings, branch, base_sha, remote_git = [], None, None, None
+    warnings, branch, base_sha, snapshot = [], None, None, None
     if a.on:
         if not a.cwd or a.worktree:
             die("--on needs --cwd (an absolute path on that machine) and does not support --worktree")
@@ -558,9 +681,9 @@ def cmd_spawn(a):
         # Exclude the outbox and check artifacts there too, and snapshot the checkout so `collect`
         # can list what this worker changed (there is no worktree to diff on another machine).
         try:
-            remote_git = remote_py(a.on, "prep", cwd, f"/{DIRNAME}/", *ARTIFACT_EXCLUDES)
-            if not remote_git.get("git"):
-                remote_git = None
+            snapshot = checkout_py(a.on, "prep", cwd, f"/{DIRNAME}/", *ARTIFACT_EXCLUDES)
+            if not snapshot.get("git"):
+                snapshot = None
                 warnings.append(f"{cwd} on {a.on} is not a git repo: collect can't list this worker's changes")
         except HcError as e:
             warnings.append(f"could not snapshot {cwd} on {a.on} ({e.message}); collect can't list its changes")
@@ -576,9 +699,16 @@ def cmd_spawn(a):
         cwd = str(Path(a.cwd).resolve()) if a.cwd else str(root)
         if not Path(cwd).is_dir():
             die(f"--cwd {cwd} is not a folder")
+        if repo_root(Path(cwd)):  # shared checkout: snapshot it so `collect` can list what changed
+            try:
+                snapshot = checkout_py(None, "snap", cwd)
+            except HcError as e:
+                warnings.append(f"could not snapshot {cwd} ({e.message}); collect can't list its changes")
     outbox = f"{cwd}/{DIRNAME}/{run}/out/{a.name}"
+    top = cwd if branch else (snapshot or {}).get("top")
 
-    brief = compose_brief(run, a.name, a.role, task, lead, cwd, outbox, bool(a.on), policy_text(root))
+    brief = compose_brief(run, a.name, a.role, task, lead, cwd, outbox, bool(a.on), policy_text(root),
+                          scope, top)
     archive = rundir / "workers" / a.name
     archive.mkdir(parents=True, exist_ok=True)
     (archive / "BRIEF.md").write_text(brief)
@@ -612,6 +742,10 @@ def cmd_spawn(a):
         if not a.no_scrub:
             argv = ["sh", "-c", SCRUB_SH + ' exec "$@"', "hco"] + argv
         launch = "direct"
+    if scope and not top:
+        warnings.append(f"--scope can't be checked: {cwd} is not a git repo (or its snapshot failed)")
+    elif not scope and a.role not in READ_ONLY_ROLES:
+        warnings.append("no --scope: collect and merge can't flag files this worker changes outside its task")
 
     trust_note = None
     if a.trust:
@@ -639,8 +773,7 @@ def cmd_spawn(a):
         "terminal": term, "address": address, "agent": a.agent, "role": a.role, "launch": launch,
         "permissions": a.permissions, "scrub": not a.no_scrub, "cwd": cwd, "outbox": outbox, "on": a.on, "worktree": cwd if branch else None,
         "branch": branch, "base": base_sha, "spawned": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "fingerprint": None if (a.on or branch) else fingerprint(cwd),
-        "remote_git": remote_git,
+        "scope": scope or None, "snapshot": snapshot,
     }
     write_json(rundir / "run.json", data)
     code = 0
@@ -650,7 +783,7 @@ def cmd_spawn(a):
         code = 3
     print(json.dumps({"worker": a.name, "terminal": term, "address": address, "launch": launch,
                       "permissions": a.permissions, "scrub": not a.no_scrub, "cwd": cwd,
-                      "branch": branch, "brief": f"{outbox}/BRIEF.md", "first_message": fm,
+                      "branch": branch, "scope": scope or None, "brief": f"{outbox}/BRIEF.md", "first_message": fm,
                       **({"trust": trust_note} if trust_note else {}), "warnings": warnings}, indent=2))
     return code
 
@@ -740,7 +873,8 @@ def cmd_wait(a):
 
 
 def fingerprint(cwd: str):
-    """A hash of a checkout's HEAD, status and diff; None outside git."""
+    """A hash of a checkout's HEAD, status and diff; None outside git. Only for runs whose shared-checkout
+    workers were spawned by an older hco (newer ones get a file-level snapshot)."""
     if not Path(cwd).is_dir() or not repo_root(Path(cwd)):
         return None
     import hashlib
@@ -756,11 +890,25 @@ def changed_files(w):
     if not w.get("worktree") or not Path(w["worktree"]).is_dir():
         return None
     wt, files = w["worktree"], set()
-    if w.get("base"):
-        files.update(git(["diff", "--name-only", f"{w['base']}...HEAD"], wt, check=False).stdout.split())
-    for line in git(["status", "--porcelain", "--untracked-files=all"], wt, check=False).stdout.splitlines():
-        files.add(line[3:].split(" -> ")[-1].strip('"'))
-    return sorted(f for f in files if f and not f.startswith(DIRNAME + "/"))
+    if w.get("base"):  # -z: unquoted names; --no-renames: a rename lists its old path too
+        files.update(git_paths(git(["diff", "--name-only", "-z", "--no-renames", f"{w['base']}...HEAD"], wt,
+                                   check=False).stdout))
+    files.update(status_paths(git(["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all"], wt,
+                                  check=False).stdout))
+    return sorted(f for f in files if f and not in_outbox_dir(f))
+
+
+def scope_report(name, w, files):
+    """collect's scope line for a writer, or None for a read-only role (those are flagged on any change)."""
+    if w["role"] in READ_ONLY_ROLES:
+        return None
+    scope = w.get("scope")
+    if not scope:
+        return "scope: none set at spawn; check these files against the plan yourself" if files else None
+    bad = out_of_scope(files, scope)
+    if bad:
+        return f"!! {name} changed files outside its scope ({', '.join(scope)}): {', '.join(bad)}"
+    return f"scope ok ({', '.join(scope)})"
 
 
 def cmd_collect(a):
@@ -771,27 +919,38 @@ def cmd_collect(a):
         print(f"=== {name} ({w['agent']}, {w['role']}) {w['address']}")
         print(f"STATUS: {first_line(status) if status else '(no STATUS file)'}")
         files = changed_files(w)
+        snap = w.get("snapshot") or w.get("remote_git")  # remote_git: runs spawned by an older hco
         if files is not None:
             print(f"changed in worktree ({w['branch']}): {', '.join(files) if files else 'nothing'}")
             if files and w["role"] in READ_ONLY_ROLES:
                 print(f"!! {name} is a {w['role']} worker but changed files")
+        elif snap:
+            where = f"{w['on']}:{w['cwd']}" if w.get("on") else w["cwd"]
+            try:
+                files = checkout_py(w.get("on"), "changed", w["cwd"], stdin=json.dumps(snap))["changed"]
+                print(f"changed in {where} since this worker started (by it or another worker "
+                      f"there): {', '.join(files) if files else 'nothing'}")
+                if files and w["role"] in READ_ONLY_ROLES:
+                    print(f"!! {name} is a {w['role']} worker and files changed in its checkout")
+            except HcError as e:
+                print(f"could not check changes in {where}: {e.message}")
         elif w.get("fingerprint"):
             same = fingerprint(w["cwd"]) == w["fingerprint"]
             print(f"shared checkout {w['cwd']}: " + ("unchanged since this worker started" if same else
                   "CHANGED since this worker started (by it or by another worker there)"))
             if not same and w["role"] in READ_ONLY_ROLES:
                 print(f"!! {name} is a {w['role']} worker and its checkout changed: check git status there")
-        elif w.get("remote_git"):
-            try:
-                files = remote_py(w["on"], "changed", w["cwd"], stdin=json.dumps(w["remote_git"]))["changed"]
-                print(f"changed in {w['on']}:{w['cwd']} since this worker started (by it or another worker "
-                      f"there): {', '.join(files) if files else 'nothing'}")
-                if files and w["role"] in READ_ONLY_ROLES:
-                    print(f"!! {name} is a {w['role']} worker and files changed in its checkout")
-            except HcError as e:
-                print(f"could not check changes on {w['on']}: {e.message}")
         elif w.get("on"):
             print(f"changes on {w['on']} not tracked (no git snapshot at spawn): check git status there")
+        elif w.get("worktree"):
+            print(f"worktree {w['worktree']} is gone: changes can't be listed")
+        else:
+            print(f"changes in {w['cwd']} not tracked (no git snapshot at spawn)")
+        note = scope_report(name, w, files) if files is not None else None
+        if note:
+            print(note)
+        elif files is None and w.get("scope"):
+            print(f"!! scope ({', '.join(w['scope'])}) not checked: no file list for this worker")
         print(f"RESULT.md: {w['outbox']}/RESULT.md")
         if result:
             lines = result.splitlines()
@@ -801,6 +960,27 @@ def cmd_collect(a):
         else:
             print("(no RESULT.md)")
         print()
+    return 0
+
+
+def cmd_scope(a):
+    """Show a worker's scope; with --add, widen it (e.g. after it reported BLOCKED: needs <path>)."""
+    rundir, data = load_run(a.run)
+    w = data["workers"].get(a.name)
+    if w is None:
+        die(f"no worker '{a.name}' in run {data['run']}")
+    if a.add:
+        if w["role"] in READ_ONLY_ROLES:
+            die(f"{a.name} is a {w['role']} worker; it may change no files")
+        have = w.get("scope") or []
+        add = [p for p in normalize_scope(a.add) if p not in have]
+        w["scope"] = have + add
+        write_json(rundir / "run.json", data)
+        if add:
+            pats = ", ".join(add)
+            print(f"added to {a.name}'s scope: {pats}")
+            print(f'tell the worker: hc send {w["terminal"]} "You may now also change: {pats}. Continue your task."')
+    print(f"scope of {a.name}: {', '.join(w['scope']) if w.get('scope') else '(none set)'}")
     return 0
 
 
@@ -819,21 +999,37 @@ def cmd_merge(a):
         die("no worktree workers to merge")
     dirty_root = git(["status", "--porcelain", "--untracked-files=no"], root).stdout.strip()
     target = git(["rev-parse", "--abbrev-ref", "HEAD"], root).stdout.strip()
+    files_of = {n: changed_files(w) or [] for n, w in pending}
+    outside = {n: bad for n, w in pending if (bad := out_of_scope(files_of[n], w.get("scope")))}
     if a.dry_run:
         for name, w in pending:
             ahead = git(["rev-list", "--count", f"{target}..{w['branch']}"], root).stdout.strip()
-            files = changed_files(w) or []
-            print(f"{name} ({w['branch']}): {len(files)} file(s), {ahead} commit(s) ahead of {target}")
+            files = files_of[name]
+            scope = f"scope {', '.join(w['scope'])}" if w.get("scope") else "no scope set"
+            print(f"{name} ({w['branch']}): {len(files)} file(s), {ahead} commit(s) ahead of {target}; {scope}")
             for f in files:
-                print(f"  {f}")
+                print(f"  !! {f}   (outside scope)" if f in outside.get(name, ()) else f"  {f}")
+        if outside:
+            n = sum(len(v) for v in outside.values())
+            print(f"note: {n} file(s) outside their worker's scope; a real merge would refuse "
+                  "(restore or delete them in the worktree, or --ignore-scope)")
         if dirty_root:
             print(f"note: {root} has uncommitted changes to tracked files; a real merge would refuse")
         print("dry run: nothing committed or merged")
         return 0
     if dirty_root:
         die(f"{root} has uncommitted changes to tracked files; commit or stash them first")
+    if outside and not a.ignore_scope:
+        for name, bad in outside.items():
+            w = data["workers"][name]
+            print(f"OUT OF SCOPE {name} (scope {', '.join(w['scope'])}): {', '.join(bad)}")
+        print("merge refused; nothing committed or merged. Restore or delete those files in the worktree, "
+              "or, if they belong in the change, rerun with --ignore-scope and say why in your report.")
+        return 1
+    for name, bad in outside.items():
+        print(f"merging {name} despite files outside its scope (--ignore-scope): {', '.join(bad)}")
     for name, w in pending:
-        files = changed_files(w) or []
+        files = files_of[name]
         dirty = git(["status", "--porcelain", "--untracked-files=all"], w["worktree"]).stdout.strip()
         if dirty:
             git(["add", "-A"], w["worktree"])  # the outbox is git-excluded by `init`
@@ -862,13 +1058,13 @@ def archive_outbox(rundir: Path, name: str, w: dict):
     dest.mkdir(parents=True, exist_ok=True)
     if w.get("on"):
         try:
-            files = remote_py(w["on"], "outbox", w["outbox"])
+            files = checkout_py(w["on"], "outbox", w["outbox"])
         except HcError as e:
             return f"kept remote outbox of {name} on {w['on']} (could not fetch it: {e.message})"
         for f, text in files.items():
             (dest / f).write_text(text)
         try:
-            remote_py(w["on"], "rmout", w["outbox"])
+            checkout_py(w["on"], "rmout", w["outbox"])
         except HcError as e:
             return f"archived {name}'s remote outbox but could not delete it on {w['on']}: {e.message}"
         return f"archived and removed {name}'s outbox on {w['on']}"
@@ -939,6 +1135,11 @@ def main(argv=None):
     p.add_argument("--brief", required=True, help="file with the worker's task body (Markdown)")
     p.add_argument("--role", default="implement", help="implement, review, research, test, fix (default implement)")
     p.add_argument("--cwd", help="working folder (default: run root; required with --on)")
+    p.add_argument("--scope", action="extend", nargs="+", metavar="PATTERN",
+                   help="files this worker may change, relative to its repo root (repeatable): "
+                        "'src/auth/**', 'tests/test_auth.py', 'docs/' ('*' stays in one folder, '**' spans "
+                        "folders, a folder covers everything under it). collect flags other changed files and "
+                        "merge refuses them. Not for review/research roles")
     p.add_argument("--worktree", action="store_true", help="isolate in a new git worktree on branch hco/<run>/<name>")
     p.add_argument("--base", default="HEAD", help="commit the worktree starts from (default HEAD)")
     p.add_argument("--on", help="run on another hc machine")
@@ -954,6 +1155,12 @@ def main(argv=None):
                    help="pre-accept the agent's folder-trust prompt for the worker's folder "
                         "(edits ~/.claude.json or ~/.codex/config.toml; this machine only)")
 
+    p = sub.add_parser("scope", help="show a worker's scope, or widen it with --add")
+    p.add_argument("--run", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--add", action="extend", nargs="+", metavar="PATTERN",
+                   help="patterns to allow from now on (same syntax as spawn --scope)")
+
     for name, helptext in (("wait", "hc wait --children any, then a status table"),
                            ("status", "status table"), ("collect", "results and changed files"),
                            ("merge", "commit worktree workers' changes and merge their branches"),
@@ -964,6 +1171,8 @@ def main(argv=None):
             p.add_argument("--name", action="append", help="worker to merge (repeatable; default all, in spawn order)")
             p.add_argument("--dry-run", action="store_true",
                            help="list each worker's files and commits that would be merged; change nothing")
+            p.add_argument("--ignore-scope", action="store_true",
+                           help="merge even when a worker changed files outside its --scope")
         if name == "wait":
             p.add_argument("--timeout", type=int, default=DEFAULT_WAIT,
                            help=f"seconds (default {DEFAULT_WAIT}; keep below your shell tool's limit)")
@@ -977,7 +1186,8 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     handlers = {"preflight": cmd_preflight, "init": cmd_init, "spawn": cmd_spawn, "wait": cmd_wait,
-                "status": cmd_status, "collect": cmd_collect, "merge": cmd_merge, "cleanup": cmd_cleanup}
+                "status": cmd_status, "collect": cmd_collect, "scope": cmd_scope, "merge": cmd_merge,
+                "cleanup": cmd_cleanup}
     try:
         return handlers[a.cmd](a)
     except HcError as e:

@@ -369,15 +369,16 @@ class Remote(Base):
         subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=self.far, check=True)
         (self.far / "keep.txt").write_text("dirty before the worker\n")  # pre-existing change: not the worker's
 
-    def spawn_far(self, run, name="w1", role="implement", cwd=None, **kw):
+    def spawn_far(self, run, name="w1", role="implement", cwd=None, *extra, **kw):
         return json.loads(self.hco("spawn", "--run", run, "--name", name, "--agent", "claude", "--role", role,
-                                   "--on", "box", "--cwd", str(cwd or self.far), "--brief", self.brief(), **kw).stdout)
+                                   "--on", "box", "--cwd", str(cwd or self.far), "--brief", self.brief(), *extra,
+                                   **kw).stdout)
 
     def collect(self, run):
         return self.hco("collect", "--run", run).stdout
 
     def test_spawn_excludes_outbox_and_artifacts_there(self):
-        out = self.spawn_far(self.init_run())
+        out = self.spawn_far(self.init_run(), "w1", "implement", None, "--scope", "a.txt")
         self.assertEqual(out["warnings"], [])
         ex = (self.far / ".git/info/exclude").read_text().splitlines()
         self.assertIn("/.hc-orchestrate/", ex)
@@ -434,6 +435,26 @@ class Remote(Base):
         self.assertEqual((arch / "out" / "STATUS").read_text(), "DONE\n")
         self.assertTrue((arch / "BRIEF.md").is_file())
 
+    def test_scope_is_checked_on_the_remote_checkout(self):
+        run = self.init_run()
+        self.spawn_far(run, "w1", "implement", None, "--scope", "a.txt")
+        (self.far / "a.txt").write_text("in scope\n")
+        (self.far / "new.txt").write_text("not in scope\n")
+        self.assertIn("!! w1 changed files outside its scope (a.txt): new.txt\n", self.collect(run))
+
+    def test_run_spawned_by_older_hco_still_collects(self):
+        """run.json from before the scope change kept the remote snapshot under `remote_git`."""
+        run = self.init_run()
+        self.spawn_far(run)
+        rj = self.repo / ".hc-orchestrate" / run / "run.json"
+        data = json.loads(rj.read_text())
+        w = data["workers"]["w1"]
+        w["remote_git"], w["fingerprint"] = w.pop("snapshot"), None
+        del w["scope"]
+        rj.write_text(json.dumps(data))
+        (self.far / "a.txt").write_text("changed\n")
+        self.assertIn("worker there): a.txt\n", self.collect(run))
+
     def test_cleanup_keeps_remote_outbox_when_unreachable(self):
         run = self.init_run()
         out = self.spawn_far(run)
@@ -443,10 +464,218 @@ class Remote(Base):
         self.assertTrue((Path(out["brief"]).parent / "STATUS").is_file())
 
 
+class Scope(Base):
+    """--scope: the files a writer may change, checked by collect and enforced by merge."""
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(["git", *args], cwd=cwd or self.repo, check=True, capture_output=True, text=True)
+
+    def run_json(self, run):
+        return json.loads((self.repo / ".hc-orchestrate" / run / "run.json").read_text())
+
+    def wt(self, run, name, scope, files):
+        out = json.loads(self.spawn(run, name, "--worktree", *(["--scope", *scope] if scope else [])).stdout)
+        for fname, text in files.items():
+            p = Path(out["cwd"]) / fname
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+        return out
+
+    def head(self):
+        return self.git("rev-parse", "HEAD").stdout
+
+    def test_spawn_records_scope_and_puts_it_in_the_brief(self):
+        run = self.init_run()
+        out = json.loads(self.spawn(run, "w1", "--worktree", "--scope", "./src/auth/**", "README.md",
+                                    "--scope", "docs/").stdout)
+        self.assertEqual(out["scope"], ["src/auth/**", "README.md", "docs/"])
+        self.assertFalse(any("--scope" in w for w in out["warnings"]))
+        self.assertEqual(self.run_json(run)["workers"]["w1"]["scope"], ["src/auth/**", "README.md", "docs/"])
+        brief = Path(out["brief"]).read_text()
+        self.assertIn(f"relative to `{out['cwd']}`", brief)
+        self.assertIn("  - `src/auth/**`\n  - `README.md`\n  - `docs/`\n", brief)
+        self.assertIn("BLOCKED: needs <path> (outside my scope)", brief)
+
+    def test_writer_without_scope_gets_a_warning_and_the_old_brief_line(self):
+        run = self.init_run()
+        out = json.loads(self.spawn(run).stdout)
+        self.assertTrue(any(w.startswith("no --scope") for w in out["warnings"]))
+        self.assertIn("Change only what the Scope section of your task allows.", Path(out["brief"]).read_text())
+        self.assertIsNone(self.run_json(run)["workers"]["w1"]["scope"])
+
+    def test_reviewer_gets_no_scope_warning_and_rejects_scope(self):
+        run = self.init_run()
+        rev = lambda name, *x: self.hco("spawn", "--run", run, "--name", name, "--agent", "claude", "--role",
+                                         "review", "--brief", self.brief(), *x, check=False)
+        self.assertFalse(any("--scope" in w for w in json.loads(rev("r1").stdout)["warnings"]))
+        p = rev("r2", "--scope", "src/**")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("may change none", p.stderr)
+
+    def test_bad_patterns_are_rejected_before_anything_starts(self):
+        run = self.init_run()
+        for bad, why in (("/abs/src/**", "relative to the repo root"), ("src/../etc", "'..'"),
+                         ("", "empty"), ("./", "empty")):
+            p = self.spawn(run, "w1", "--worktree", "--scope", bad, check=False)
+            self.assertNotEqual(p.returncode, 0, bad)
+            self.assertIn(why, p.stderr)
+        self.assertEqual(self.run_json(run)["workers"], {})
+        self.assertFalse((self.repo / ".hc-orchestrate" / run / "wt").exists())  # no worktree was made
+
+    def test_collect_flags_files_outside_scope(self):
+        run = self.init_run()
+        out = self.wt(run, "w1", ["src/**"], {"src/a.py": "a"})
+        self.assertIn("scope ok (src/**)", self.hco("collect", "--run", run).stdout)
+        (Path(out["cwd"]) / "notes.txt").write_text("scratch")
+        self.assertIn("!! w1 changed files outside its scope (src/**): notes.txt\n",
+                      self.hco("collect", "--run", run).stdout)
+
+    def test_collect_without_scope_asks_for_a_manual_check(self):
+        run = self.init_run()
+        self.wt(run, "w1", None, {"a.py": "a"})
+        self.assertIn("scope: none set at spawn", self.hco("collect", "--run", run).stdout)
+
+    def test_merge_refuses_out_of_scope_and_changes_nothing(self):
+        run = self.init_run()
+        self.wt(run, "a", ["a/**"], {"a/x.py": "a"})
+        b = self.wt(run, "b", ["b/**"], {"b/x.py": "b", "stray.log": "junk"})
+        before = self.head()
+        p = self.hco("merge", "--run", run, check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("OUT OF SCOPE b (scope b/**): stray.log", p.stdout)
+        self.assertNotIn("OUT OF SCOPE a", p.stdout)
+        self.assertEqual(self.head(), before)  # not even the in-scope worker a was merged
+        self.assertFalse((self.repo / "a").exists())
+        self.assertEqual(self.git("log", "--oneline", "-1", f"hco/{run}/a").stdout,
+                         self.git("log", "--oneline", "-1", before.strip()).stdout)  # nothing committed in a either
+        (Path(b["cwd"]) / "stray.log").unlink()  # the lead removes the stray file, then merges
+        out = self.hco("merge", "--run", run).stdout
+        self.assertIn("merged a", out)
+        self.assertIn("merged b", out)
+        self.assertEqual(sorted(self.git("ls-files").stdout.split()), ["a/x.py", "b/x.py"])
+
+    def test_merge_ignore_scope_merges_and_says_so(self):
+        run = self.init_run()
+        self.wt(run, "a", ["src/**"], {"src/x.py": "x", "package-lock.json": "{}"})
+        out = self.hco("merge", "--run", run, "--ignore-scope").stdout
+        self.assertIn("merging a despite files outside its scope (--ignore-scope): package-lock.json", out)
+        self.assertIn("merged a", out)
+        self.assertTrue((self.repo / "package-lock.json").is_file())
+
+    def test_dry_run_marks_out_of_scope_files(self):
+        run = self.init_run()
+        self.wt(run, "a", ["src/**"], {"src/x.py": "x", "notes.md": "n"})
+        self.wt(run, "b", None, {"b.txt": "b"})
+        out = self.hco("merge", "--run", run, "--dry-run").stdout
+        self.assertIn(f"a (hco/{run}/a): 2 file(s), 0 commit(s) ahead of", out)
+        self.assertIn("; scope src/**\n", out)
+        self.assertIn("  !! notes.md   (outside scope)\n", out)
+        self.assertIn("  src/x.py\n", out)
+        self.assertIn("; no scope set\n", out)
+        self.assertIn("note: 1 file(s) outside their worker's scope; a real merge would refuse", out)
+
+    def test_rename_out_of_scope_is_flagged_by_its_old_path(self):
+        (self.repo / "legacy").mkdir()
+        (self.repo / "legacy" / "old.py").write_text("x = 1\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "legacy")
+        run = self.init_run()
+        # Moving legacy/old.py into src/ deletes a file outside the scope. With rename detection git only
+        # shows the new path, so the deletion went unseen; both a staged and a committed rename must show it.
+        for name, commit in (("staged", False), ("committed", True)):
+            w = self.wt(run, name, ["src/**"], {})
+            (Path(w["cwd"]) / "src").mkdir()
+            self.git("mv", "legacy/old.py", "src/new.py", cwd=w["cwd"])
+            if commit:
+                self.git("commit", "-q", "-m", "worker committed a rename", cwd=w["cwd"])
+        out = self.hco("collect", "--run", run).stdout
+        self.assertIn("!! staged changed files outside its scope (src/**): legacy/old.py\n", out)
+        self.assertIn("!! committed changed files outside its scope (src/**): legacy/old.py\n", out)
+        self.assertEqual(out.count("legacy/old.py, src/new.py"), 2)  # both paths in each file list
+
+    def test_names_with_spaces_and_unicode_match_their_scope(self):
+        run = self.init_run()
+        self.wt(run, "w1", ["docs/**"], {"docs/naïve file (1).md": "x"})
+        out = self.hco("collect", "--run", run).stdout
+        self.assertIn("docs/naïve file (1).md", out)
+        self.assertIn("scope ok (docs/**)", out)
+
+    def test_shared_checkout_lists_its_files_and_checks_scope(self):
+        (self.repo / "before.txt").write_text("dirty before the worker\n")  # not this worker's change
+        run = self.init_run()
+        out = json.loads(self.spawn(run, "w1", "--scope", "src/**").stdout)
+        self.assertEqual(self.run_json(run)["workers"]["w1"]["snapshot"]["top"], str(self.repo.resolve()))
+        self.assertIn(f"relative to `{self.repo.resolve()}`", Path(out["brief"]).read_text())
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("a")
+        (self.repo / "other.txt").write_text("o")
+        text = self.hco("collect", "--run", run).stdout
+        self.assertIn(f"changed in {self.repo.resolve()} since this worker started (by it or another worker "
+                      "there): other.txt, src/a.py\n", text)
+        self.assertIn("!! w1 changed files outside its scope (src/**): other.txt\n", text)
+
+    def test_scope_add_widens_a_blocked_worker_and_merge_then_accepts(self):
+        run = self.init_run()
+        self.wt(run, "w1", ["src/**"], {"src/a.py": "a", "tests/test_a.py": "t"})
+        self.assertEqual(self.hco("merge", "--run", run, check=False).returncode, 1)
+        out = self.hco("scope", "--run", run, "--name", "w1", "--add", "tests/test_a.py", "src/**").stdout
+        self.assertIn("added to w1's scope: tests/test_a.py\n", out)  # src/** was already there
+        self.assertIn(f'hc send {run}-w1 "You may now also change: tests/test_a.py.', out)
+        self.assertEqual(self.run_json(run)["workers"]["w1"]["scope"], ["src/**", "tests/test_a.py"])
+        self.assertIn("scope ok (src/**, tests/test_a.py)", self.hco("collect", "--run", run).stdout)
+        self.assertIn("merged w1", self.hco("merge", "--run", run).stdout)
+
+    def test_scope_shows_and_refuses_reviewers_and_strangers(self):
+        run = self.init_run()
+        self.spawn(run, "w1")
+        self.assertIn("scope of w1: (none set)", self.hco("scope", "--run", run, "--name", "w1").stdout)
+        self.hco("spawn", "--run", run, "--name", "rev", "--agent", "claude", "--role", "review", "--brief",
+                 self.brief())
+        p = self.hco("scope", "--run", run, "--name", "rev", "--add", "x", check=False)
+        self.assertIn("may change no files", p.stderr)
+        self.assertNotEqual(self.hco("scope", "--run", run, "--name", "zzz", check=False).returncode, 0)
+
+    def test_shared_checkout_in_a_subfolder_uses_repo_root_paths(self):
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        run = self.init_run()
+        self.hco("spawn", "--run", run, "--name", "w1", "--agent", "claude", "--brief", self.brief(),
+                 "--cwd", str(sub), "--scope", "pkg/**")
+        (sub / "mod.py").write_text("m")
+        text = self.hco("collect", "--run", run).stdout
+        self.assertIn("worker there): pkg/mod.py\n", text)  # the outbox in pkg/.hc-orchestrate is not listed
+        self.assertIn("scope ok (pkg/**)", text)
+
+
 class Units(unittest.TestCase):
     def test_demote_headings_skips_code_fences(self):
         md = "# Top\ntext\n```\n# not a heading\n```\n## Sub"
         self.assertEqual(hco.demote_headings(md, 3), "### Top\ntext\n```\n# not a heading\n```\n#### Sub")
+
+    def test_scope_matching(self):
+        cases = [
+            ("src/auth/**", "src/auth/a.ts", True), ("src/auth/**", "src/auth/x/y.ts", True),
+            ("src/auth/**", "src/authz/a.ts", False), ("src/auth/", "src/auth/x/y.ts", True),
+            ("src/auth", "src/auth/a.ts", True), ("src/auth", "src/auth.ts", False),
+            ("src/*.py", "src/a.py", True), ("src/*.py", "src/sub/a.py", False),
+            ("*.md", "README.md", True), ("*.md", "docs/a.md", False),
+            ("**/*.md", "a.md", True), ("**/*.md", "docs/x/a.md", True),
+            ("src/**/test_*.py", "src/test_a.py", True), ("src/**/test_*.py", "src/a/b/test_a.py", True),
+            ("src/**/test_*.py", "src/a/b/a.py", False), ("src/**/test_*.py", "test_a.py", False),
+            ("a?c", "abc", True), ("a?c", "a/c", False),
+            ("file[0-9].txt", "file3.txt", True), ("file[!0-9].txt", "filex.txt", True),
+            ("file[!0-9].txt", "file3.txt", False),
+            ("app/[id]/page.tsx", "app/[id]/page.tsx", True),  # literal brackets (Next.js routes)
+            ("app/[id]", "app/[id]/page.tsx", True),
+            ("docs/my file (1).md", "docs/my file (1).md", True), ("a+b.txt", "aab.txt", False),
+            ("**", "any/where/at/all", True), ("src", "srcx/a", False),
+        ]
+        for pattern, path, want in cases:
+            self.assertEqual(hco.in_scope(path, [pattern]), want, f"{pattern!r} vs {path!r}")
+
+    def test_out_of_scope_without_patterns_checks_nothing(self):
+        self.assertEqual(hco.out_of_scope(["anything"], None), [])
+        self.assertEqual(hco.out_of_scope(["a/x", "b/y", "c"], ["a/**", "c"]), ["b/y"])
 
 
 if __name__ == "__main__":

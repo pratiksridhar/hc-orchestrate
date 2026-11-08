@@ -82,6 +82,7 @@ What the skill relies on:
 | `SKILL.md` | The lead's playbook: preflight → plan → spawn → supervise → verify → integrate → report → clean up. |
 | `scripts/hco.py` | Deterministic helper (stdlib Python): run ids, labels, git worktrees per writer, the worker brief, status tables, result collection, commit-and-merge of worker branches, cleanup scoped to one run. |
 | Worker contract | Every brief carries scope rules, "no sub-agents", your policy, and a **two-channel report**: files in an outbox (`RESULT.md` + `STATUS`) and a one-line `hc send` prefixed `[hco <run>/<name>]`. |
+| Scope check | `spawn --scope 'src/auth/**'` records the files a writer may change and lists them in its brief; `collect` flags any other file it changed (renames and deletions included) and `merge` refuses to commit them. `hco scope --add` widens one worker's scope. |
 | `scripts/hcboard.py`, `docstore_worker.py`, `hcdoc.py` | **Board mode** (stdlib Python): the orchestrator loop, the job-claiming worker and the guarded doc-store helper they share. See below. |
 | `templates/hco-claude.md`, `hco-codex.md` | hc templates so core waits for the agent to be ready before handing it the task, and tells the lead if it didn't go in. |
 | `references/` | Orchestration recipes, the verified hc facts the skill depends on, and the doc-store notes behind board mode. |
@@ -285,7 +286,9 @@ results with "unchanged since this worker started".
   sandbox off (Claude `--dangerously-skip-permissions`, Codex
   `--dangerously-bypass-approvals-and-sandbox`; set in the templates and in
   `hco.py`). Scope, "no sub-agents" and policy are then only instructions in the
-  brief, not enforced, and a worker can read any file you can (`~/.ssh`, credential
+  brief, not enforced while the worker runs (`--scope` detects stray files in the repo
+  afterwards, at `collect` and `merge`; it can't see files outside the repo or
+  anything git ignores), and a worker can read any file you can (`~/.ssh`, credential
   files such as `~/.broadcom-creds`). `hco spawn --permissions safe` restores the careful mode: Claude
   `--permission-mode acceptEdits` plus an allow rule for `hc send`; Codex
   `--sandbox workspace-write --ask-for-approval on-request`. In safe mode a worker
@@ -349,8 +352,11 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
   `merge`, `cleanup --worktrees`, and `--on` with Claude and Codex workers on a Linux machine);
   see CHANGES.md.
 - `merge` commits everything new in a worktree that git doesn't ignore. `init` excludes common
-  check artifacts, but anything else a worker leaves behind would be committed: run
-  `hco merge --dry-run` first and remove files outside the worker's scope.
+  check artifacts; for a worker spawned with `--scope`, anything else outside its scope makes
+  `merge` refuse (exit 1, nothing committed). A worker spawned without `--scope` is not
+  checked: run `hco merge --dry-run` first and remove stray files yourself.
+- Scope patterns are relative to the repo root (also for a worker whose `--cwd` is a subfolder)
+  and always anchored: `*.md` is root-level only, `**/*.md` is any depth.
 - In `--permissions safe`, Codex's sandbox blocks `hc send` (verified live); its reports then
   travel as outbox files plus hc status events. In the default bypass mode it works.
 - A brand-new folder (e.g. a fresh worktree) may show the agent's
