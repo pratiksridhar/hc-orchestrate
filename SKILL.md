@@ -119,8 +119,9 @@ returns on the next news and prints a status table.
 Steer with `hc send <t> "..."` (`--if idle` to send only between turns),
 `hc interrupt <t>`, `hc read <t> --lines 100`. Do useful work meanwhile.
 
-Reporting caveats: Codex's sandbox blocks `hc send`, so its reports reach you as
-STATUS/RESULT.md files plus hc's status events, not as messages; a worker with
+Reporting caveats: in `--permissions safe`, Codex's sandbox blocks `hc send`, so its
+reports reach you as STATUS/RESULT.md files plus hc's status events, not as messages
+(in the default bypass mode its `hc send` works); a worker with
 `reported: false` never signals completion, so rely on its STATUS file and
 `hc read`.
 
@@ -143,8 +144,13 @@ STATUS/RESULT.md files plus hc's status events, not as messages; a worker with
 Workers don't commit. After phase 4 passes, in dependency order:
 
 ```sh
+hco merge --run <run> --dry-run                    # first: the files each worker would commit
 hco merge --run <run> --name api [--name ui ...]   # omit --name for all, in spawn order
 ```
+Every file in the dry run must be in that worker's scope; anything else (a stray
+artifact, a scratch file) is removed from the worktree before merging. `init`
+already keeps common check artifacts (`__pycache__/`, `*.pyc`, `.pytest_cache/`,
+`node_modules/`, `.DS_Store`, …) out via `.git/info/exclude`.
 For each worker it commits the worktree's changes as `hco <run>/<name>`, then
 `git merge --no-ff`s `hco/<run>/<name>` into the current branch. It refuses a
 root with uncommitted tracked changes, and on a conflict it aborts that merge,

@@ -306,6 +306,43 @@ class Merge(Base):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("uncommitted changes", p.stderr)
 
+    def test_check_artifacts_are_not_committed(self):
+        # Live failure on hc 0.1.18: both workers ran their check, each left the same .pyc behind,
+        # merge committed it and the second merge conflicted although no source file was shared.
+        run = self.init_run()
+        for name, fname in (("a", "a.py"), ("b", "b.py")):
+            out = self.wt_worker(run, name, {fname: "x = 1\n"})
+            for junk in ("__pycache__/calc.cpython-313.pyc", ".pytest_cache/v/x", "node_modules/m/i.js",
+                         ".DS_Store"):
+                p = Path(out["cwd"]) / junk
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(name.encode() * 8)
+        self.assertIn("changed in worktree (hco/" + run + "/a): a.py\n", self.hco("collect", "--run", run).stdout)
+        out = self.hco("merge", "--run", run).stdout
+        self.assertIn("merged b", out)
+        tracked = subprocess.run(["git", "ls-files"], cwd=self.repo, capture_output=True, text=True).stdout.split()
+        self.assertEqual(sorted(tracked), ["a.py", "b.py"])
+
+    def test_init_exclude_is_idempotent(self):
+        self.init_run()
+        self.init_run()
+        lines = (self.repo / ".git/info/exclude").read_text().splitlines()
+        self.assertEqual(lines.count("/.hc-orchestrate/"), 1)
+        self.assertEqual(lines.count("__pycache__/"), 1)
+
+    def test_dry_run_lists_files_and_changes_nothing(self):
+        run = self.init_run()
+        self.wt_worker(run, "a", {"a.txt": "a"})
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout
+        out = self.hco("merge", "--run", run, "--dry-run").stdout
+        self.assertIn("a (hco/" + run + "/a): 1 file(s), 0 commit(s) ahead", out)
+        self.assertIn("  a.txt", out)
+        self.assertIn("dry run", out)
+        self.assertEqual(subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True,
+                                        text=True).stdout, head)
+        self.assertFalse((self.repo / "a.txt").exists())
+        self.assertIn("merged a", self.hco("merge", "--run", run).stdout)  # still merges afterwards
+
     def test_name_filter_and_unknown_name(self):
         run = self.init_run()
         self.wt_worker(run, "a", {"a.txt": "a"})

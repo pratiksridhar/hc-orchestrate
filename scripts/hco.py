@@ -11,6 +11,7 @@ brief layout, report protocol and cleanup every time.
   status  --run R                status table (hc state + each outbox STATUS)
   collect --run R                each worker's STATUS, RESULT.md and changed files
   merge   --run R [--name N]...  commit worktree workers' changes, merge their branches one by one
+                                 (--dry-run lists what would be committed)
   cleanup --run R                kill + rm the run's terminals (archives outboxes)
 
 Python 3.8+, standard library only. HCO_HC overrides the hc binary (tests).
@@ -56,6 +57,12 @@ SCRUB_SH = ("for v in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p')
             "ANTHROPIC_*|OPENAI_*|CODEX_*|CLAUDE*|HC_*|HERDR_*) ;; "
             f"*) if echo \"$v\" | grep -Eiq '{SCRUB_PAT}'; then unset \"$v\"; fi ;; esac; done;")
 READ_ONLY_ROLES = {"review", "research"}
+# Files that running a check leaves behind. `init` adds them to .git/info/exclude (shared by every
+# worktree) so `collect` doesn't list them and `merge` doesn't commit them: a committed .pyc made two
+# workers that never shared a source file conflict (live test on hc 0.1.18). Only names that are never
+# source; build/ and dist/ are left out on purpose.
+ARTIFACT_EXCLUDES = ("__pycache__/", "*.py[cod]", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
+                     ".coverage", ".coverage.*", "node_modules/", ".DS_Store")
 
 
 # ---------------------------------------------------------------- utilities
@@ -348,9 +355,12 @@ def cmd_init(a):
         exclude = (common if common.is_absolute() else root / common) / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         content = exclude.read_text() if exclude.exists() else ""
-        if f"/{DIRNAME}/" not in content.splitlines():
+        have = set(content.splitlines())
+        add = [p for p in (f"/{DIRNAME}/", *ARTIFACT_EXCLUDES) if p not in have]
+        if add:
             with exclude.open("a") as f:
-                f.write(("" if not content or content.endswith("\n") else "\n") + f"/{DIRNAME}/\n")
+                f.write(("" if not content or content.endswith("\n") else "\n")
+                        + "# hc-orchestrate: run folder and check artifacts\n" + "\n".join(add) + "\n")
     data = {"run": run, "task": a.task, "root": str(root), "lead": lead_address(),
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "workers": {}}
     write_json(rundir / "run.json", data)
@@ -697,9 +707,21 @@ def cmd_merge(a):
             die(f"no worktree worker(s) named: {', '.join(sorted(missing))}")
     if not pending:
         die("no worktree workers to merge")
-    if git(["status", "--porcelain", "--untracked-files=no"], root).stdout.strip():
-        die(f"{root} has uncommitted changes to tracked files; commit or stash them first")
+    dirty_root = git(["status", "--porcelain", "--untracked-files=no"], root).stdout.strip()
     target = git(["rev-parse", "--abbrev-ref", "HEAD"], root).stdout.strip()
+    if a.dry_run:
+        for name, w in pending:
+            ahead = git(["rev-list", "--count", f"{target}..{w['branch']}"], root).stdout.strip()
+            files = changed_files(w) or []
+            print(f"{name} ({w['branch']}): {len(files)} file(s), {ahead} commit(s) ahead of {target}")
+            for f in files:
+                print(f"  {f}")
+        if dirty_root:
+            print(f"note: {root} has uncommitted changes to tracked files; a real merge would refuse")
+        print("dry run: nothing committed or merged")
+        return 0
+    if dirty_root:
+        die(f"{root} has uncommitted changes to tracked files; commit or stash them first")
     for name, w in pending:
         files = changed_files(w) or []
         dirty = git(["status", "--porcelain", "--untracked-files=all"], w["worktree"]).stdout.strip()
@@ -817,6 +839,8 @@ def main(argv=None):
         p.add_argument("--run", required=True)
         if name == "merge":
             p.add_argument("--name", action="append", help="worker to merge (repeatable; default all, in spawn order)")
+            p.add_argument("--dry-run", action="store_true",
+                           help="list each worker's files and commits that would be merged; change nothing")
         if name == "wait":
             p.add_argument("--timeout", type=int, default=DEFAULT_WAIT,
                            help=f"seconds (default {DEFAULT_WAIT}; keep below your shell tool's limit)")

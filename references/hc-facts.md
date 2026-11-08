@@ -108,6 +108,7 @@ If your hc is newer and disagrees, `hc --skill` and `hc <cmd> --help` win.
 - `--sandbox read-only|workspace-write|danger-full-access`,
   `--ask-for-approval on-request|never`, `-c key=value` config overrides.
 - Verified live: Codex's sandbox blocks `hc send` ("hc could not start its core: Operation not permitted").
+  With `--dangerously-bypass-approvals-and-sandbox` (hco's default) it works: verified on hc 0.1.18.
   The worker contract writes STATUS/RESULT.md inside the workspace first, so
   the run still works if `hc send` is refused.
 

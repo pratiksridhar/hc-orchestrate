@@ -126,7 +126,7 @@ sequenceDiagram
     Note over W: does the task, inside its scope
     W->>O: RESULT.md + STATUS=DONE
     W-->>C: OSC 7501 idle
-    W->>L: hc send "[hco run/name] DONE …" (may be blocked in a Codex sandbox)
+    W->>L: hc send "[hco run/name] DONE …" (blocked for Codex in safe mode)
     C-->>L: hco wait returns (status event)
     L->>O: hco collect: read RESULT.md, diff vs. scope
     Note over L: the report is a claim: verify before trusting it
@@ -327,6 +327,8 @@ results with "unchanged since this worker started".
 ## Files a run creates
 
 ```
+<repo>/.git/info/exclude              + /.hc-orchestrate/ and check artifacts
+                                       (__pycache__/, *.pyc, .pytest_cache/, node_modules/, .DS_Store, …)
 <repo>/.hc-orchestrate/<run>/          (git-ignored via .git/info/exclude)
   run.json                             run + worker records
   PLAN.md                              the lead's plan
@@ -341,10 +343,14 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
 
 ## Known limits
 
-- Live-tested on hc 0.1.17 for one Claude writer (worktree) plus one Codex reviewer, and
-  a single Claude worker; see CHANGES.md. Templates, merge phase and `--on` are untested.
-- Codex's sandbox blocks `hc send` (verified live); its reports travel as outbox
-  files plus hc status events.
+- Live-tested on hc 0.1.17 (one Claude writer in a worktree plus one Codex reviewer, and a
+  single Claude worker) and on hc 0.1.18 (templates, a Claude and a Codex writer in worktrees,
+  `merge`, `cleanup --worktrees`); see CHANGES.md. `--on` is untested.
+- `merge` commits everything new in a worktree that git doesn't ignore. `init` excludes common
+  check artifacts, but anything else a worker leaves behind would be committed: run
+  `hco merge --dry-run` first and remove files outside the worker's scope.
+- In `--permissions safe`, Codex's sandbox blocks `hc send` (verified live); its reports then
+  travel as outbox files plus hc status events. In the default bypass mode it works.
 - A brand-new folder (e.g. a fresh worktree) may show the agent's
   folder-trust prompt. The template run then reports the task as not sent;
   the lead asks you to approve it in that terminal.

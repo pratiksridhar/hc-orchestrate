@@ -3,6 +3,30 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Merge live test (hc 0.1.18, Claude Code 2.1.319)
+
+Throwaway repo; a Claude writer (`hco-claude` template) added a function, a Codex writer
+(`hco-codex` template) added tests, each in its own worktree with `--trust`.
+
+### Verified
+- Template success path: both tasks went in (`first_message.sent: true`), no trust prompt.
+- Both reports arrived as tagged `hc send` messages, including Codex's (bypass mode has no
+  sandbox); `hco wait` woke on each.
+- `merge` conflict path: aborted, root left clean, exit 1. `cleanup --worktrees` removed only
+  merged worktrees and kept branches.
+
+### Found and fixed
+- `merge` committed check artifacts: running each worker's check left
+  `__pycache__/calc.cpython-313.pyc` in both worktrees, `git add -A` committed it, and the
+  second merge conflicted on it although the workers shared no source file. Once tracked, every
+  later run of the code dirtied the root and blocked `merge`.
+  - `init` now also adds common artifacts to `.git/info/exclude` (`__pycache__/`, `*.py[cod]`,
+    `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.coverage*`, `node_modules/`, `.DS_Store`),
+    idempotently. Worktrees share that file, so `collect` and `merge` skip them.
+  - New `merge --dry-run`: each worker's files and commits ahead, nothing changed.
+  - Tests: artifact regression (fails on the old code), idempotent exclude, dry run.
+- Docs: Codex's sandbox blocks `hc send` only in `--permissions safe`.
+
 ## Board mode (branch `hc-doc-get-set`)
 
 An opt-in experiment/job board on herdr-core's doc store (`doc.get` / `doc.set`). Nothing in the
