@@ -5,7 +5,11 @@ Mirrors the shapes of the REAL hc 0.1.17, verified live:
   - `ls --json`  -> slim rows {address, agent, cwd, state, turn, where[, status: "<word>"]}
   - `get --json` -> full record (name, labels, status {state,kind?}, reported, exit_code, ...)
 State lives in $FAKE_HC_STATE (a JSON file). Knobs (env): FAKE_HC_TEMPLATES (comma list),
-FAKE_HC_NOT_SENT=1 (templated run reports first_message.sent=false).
+FAKE_HC_NOT_SENT=1 (templated run reports first_message.sent=false), FAKE_HC_RUN_FAIL=1 (`run` errors),
+FAKE_HC_RUN_DELAY=<s> (`run` takes that long), FAKE_HC_SEND_FAIL=1 (`send` is refused as blocked),
+FAKE_HC_NO_CHILDREN=1 (`wait --children` errors needs_target), FAKE_HC_CHECK_SLOW=1 (a check terminal
+stays live). A terminal labeled hco.check is a plain program: `wait <t>` runs its argv and finishes it.
+`send` appends [target, text] to state["sent"].
 """
 import json
 import os
@@ -22,7 +26,10 @@ def load():
 
 
 def save(s):
-    json.dump(s, open(STATE, "w"))
+    tmp = f"{STATE}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(s, f)
+    os.replace(tmp, STATE)
 
 
 def err(kind, msg, code):
@@ -31,6 +38,7 @@ def err(kind, msg, code):
 
 
 def find(s, ref):
+    ref = ref.split("/")[-1]  # machine/t7 or machine/name: every machine is this one here
     for addr, t in s["terminals"].items():
         if ref in (addr, t.get("name")):
             return addr, t
@@ -42,6 +50,12 @@ def labels_match(t, wanted):
 
 
 def main(argv):
+    if argv[0] == "run" and os.environ.get("FAKE_HC_RUN_DELAY"):
+        import time
+        time.sleep(float(os.environ["FAKE_HC_RUN_DELAY"]))
+    import fcntl
+    lock = open(STATE + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)  # like the real core: one request at a time
     s = load()
     if argv[0] == "--version":
         print("hc 0.1.17")
@@ -76,10 +90,14 @@ def main(argv):
             else:
                 i += 1
         prog = argv[i + 1:]
+        if os.environ.get("FAKE_HC_RUN_FAIL"):
+            err("internal", "could not start the program", 1)
         s["n"] += 1
         addr = f"t{s['n']}"
+        plain = "hco.check" in labels  # a check is a plain program: no OSC 7501 status
         t = {"address": addr, "name": opts.get("--name"), "labels": labels, "cwd": opts.get("--cwd"),
-             "state": "live", "status": {"state": "working"}, "turn": 1, "reported": True,
+             "state": "live", "status": None if plain else {"state": "working"}, "turn": 0 if plain else 1,
+             "reported": not plain,
              "waiting_for_person": False, "exit_code": None, "argv": prog, "parent": os.environ.get("HC_TERMINAL_ID")}
         s["terminals"][addr] = t
         save(s)
@@ -114,8 +132,26 @@ def main(argv):
                 err("not_found", f"no file {path}", 3)
             sys.stdout.write(open(path).read())
         return
+    elif argv[0] == "wait" and argv[1] != "--children":  # wait <t>: a check terminal runs to its end here
+        import subprocess
+        addr, t = find(s, argv[1])
+        if t["state"] == "live" and "hco.check" in t["labels"] and not os.environ.get("FAKE_HC_CHECK_SLOW"):
+            p = subprocess.run(t["argv"], cwd=t["cwd"], capture_output=True, text=True)
+            t["state"], t["exit_code"] = "finished", p.returncode
+        ended = t["state"] != "live"
+        print(json.dumps({"terminal": addr, "ended": ended, "reason": "exited" if ended else "timeout",
+                          "exit_code": t.get("exit_code"), "children": []}))
     elif argv[0] == "wait":
+        if os.environ.get("FAKE_HC_NO_CHILDREN"):
+            err("needs_target", "this terminal has no children", 7)
         print(json.dumps({"terminal": None, "ended": False, "reason": "timeout", "children": []}))
+    elif argv[0] == "send":
+        addr, t = find(s, argv[1])
+        if t["state"] != "live":
+            err("finished", "that terminal has finished", 11)
+        if os.environ.get("FAKE_HC_SEND_FAIL"):
+            err("blocked", "the program is waiting for a person", 9)
+        s.setdefault("sent", []).append([addr, argv[2]])
     elif argv[0] == "kill":
         addr, t = find(s, argv[1])
         if t["state"] != "live":

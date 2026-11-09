@@ -3,6 +3,108 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Run state, plans, checks and rounds — fake-hc tests only, NOT live-tested
+
+The agent flow kept its coordination in the lead's head: dependencies were prose in PLAN.md, "verified"
+was something the lead said, a follow-up was a bare `hc send`, and a restarted lead had no way back
+into its run. This change turns each of those into data that `hco` checks. Nothing an existing run
+does changes unless a new option is used; old `run.json` files still load.
+
+### Found and fixed on the way
+- **Parallel spawns lost workers.** `spawn` read `run.json`, started the terminal (seconds), then wrote
+  its stale copy back. Six spawns started together left one worker in `run.json`; the other five
+  terminals ran unrecorded, invisible to `status`, `collect`, `merge` and `cleanup` (reproduced with the
+  previous `hco.py` and the new test: `['w4'] != ['w0', ..., 'w5']`). Agents that issue several tool calls
+  at once hit this easily. Every write now happens under a file lock (`.lock`, `fcntl`) on a fresh read,
+  and the temp file is per process.
+- **A failed spawn blocked its own retry.** When `hc run` failed after `git worktree add`, the worktree
+  and branch stayed, and spawning the same name again died on "a branch named ... already exists". A
+  failed spawn now removes the worktree, branch and outbox it made. The name is reserved in `run.json`
+  while a spawn runs (5 minutes at most); a worktree left by a spawn that was killed outright is reported,
+  never deleted or reused.
+- `spawn` crashed with a traceback when `hc run` gave no answer in 180 s, with the terminal possibly
+  running unrecorded. It now looks the terminal up and records it with a warning, or rolls back.
+- `status` and `collect` showed `(no STATUS file)` for every worker after `cleanup --worktrees` (the
+  outbox lived in the removed worktree). They now fall back to the archived copy.
+- The remote outbox archive copied only `STATUS` and `RESULT.md`; it now takes every file.
+
+### Added
+- **`hco plan` / `hco advance`.** A `plan.json` lists the workers with `spawn`'s options plus `after`
+  (`name:done`, `name` = accepted, `name:merged`) and `"cwd": "@name"`. `plan` reports every problem at
+  once and stores nothing on error: unknown keys, bad names, missing briefs, unknown or cyclic
+  dependencies, `:merged` on a worker without a worktree, scopes on read-only roles, and writers that can
+  run together whose scopes may share a file (`--allow-overlap` downgrades that to a warning). Briefs are
+  copied into the run. `advance` starts what is ready up to `max_parallel` (default 4), appends an
+  "Inputs from earlier workers" section with their RESULT.md paths, and prints JSON: `started`, `waiting`
+  with the reason per worker, `errors`, `complete`. One failing spawn does not stop the others.
+- **`spawn --check CMD`, `hco check`.** The command is stated in the brief ("report DONE only when it
+  exits 0; never weaken a test to get there"). `check` runs it with `sh -c` in the worker's folder inside
+  an hc terminal (`--no-notify`, label `hco.check=<name>`), output to `checks/<name>.log`, and records exit
+  code, duration and the tree id of the content. Exit 0 / 1 / 124 (still running; the same command resumes
+  the wait, no second terminal). A change to the folder while the check ran makes the result not count,
+  and the changed files are listed.
+- **`hco accept`.** Records the lead's verdict with a note and the tree id. Refuses a STATUS other than
+  DONE, a check that has not passed on the current files, out-of-scope files and a read-only worker that
+  changed files; `--force` stores the override and its reasons.
+- **Merge gates.** `merge` refuses (exit 1, nothing committed) a worker whose check is missing, failed or
+  older than its files, and a worker that changed after `accept`. `--dry-run` marks them; `--skip-checks`
+  overrides and says so. A worker without a check and without an accept merges as before. Merges are
+  recorded (`merged.commit`).
+- **`hco send`.** A follow-up round: text to `FOLLOWUP.r<n>.md`, old `STATUS`/`RESULT.md` renamed to
+  `STATUS.r<n-1>`/`RESULT.r<n-1>.md` (before this, a worker on round 2 still showed `DONE` from round 1),
+  the earlier accept dropped, one-line `hc send` pointing at the file. Rounds are counted against
+  `--max-rounds` (default 3; exit 4 beyond). If `hc send` fails the files are put back. Works for `--on`
+  workers through the checkout helper.
+- **`NEXT` column** in `status`/`wait` (also in `status --json`, with `round` and `age_min`): the
+  supervise table from SKILL.md computed per worker. `spawn --deadline MIN` adds "over its N min budget".
+- **`hco adopt`, polling `wait`, `hco runs`.** For a lead restarted in a new terminal: `runs` finds the
+  run without hc; `adopt` records the new lead, rewrites the address in local workers' briefs and sends
+  each live one a message. `wait` polls hc state and STATUS files when a live worker was started by
+  another terminal, when hc answers `needs_target`, or with `--poll`; it stores what it last showed, so a
+  change between two waits is not missed.
+- **Journal.** `events.jsonl` gets one line per action (init, spawn, spawn_failed, plan, advance,
+  check_started, check, accept, followup, scope_add, merge, merge_refused, merge_conflict, adopt,
+  cleanup). `hco log` prints it; `hco report` writes `REPORT.md` (a table per worker and the timeline).
+- `.github/workflows/tests.yml`: the unit tests on Python 3.11, 3.12 and 3.13.
+
+### Design notes
+- **Tree id, not timestamps.** A check or accept is tied to `git write-tree` of the folder's content,
+  built in a throwaway index (`GIT_INDEX_FILE`), outboxes excluded by pathspec. Committing the same
+  content gives the same id, which is why `merge` (which commits the worktree) can be rerun after a
+  conflict without a new check. It hashes every file on each call: fine for normal repos, slow for huge ones.
+- **`wait` decides from hco's own record** of which lead started each worker (`workers.<n>.lead`), not
+  from hc's `parent` field, whose exact form for local children is not in `references/hc-facts.md`.
+- Errors now travel as an exception to `main` instead of `sys.exit` inside helpers, so `advance` can
+  report one worker's failure and go on. Messages and exit codes are unchanged.
+
+### Assumptions about hc that the fake encodes and no live run confirmed
+`hc` could not be installed where this was written. These are taken from `references/hc-facts.md` and
+SKILL.md, and need one live pass:
+- `hc wait <t> --json` on a plain program returns when it exits, and `hc get <t> --json` then shows
+  `state: "finished"` with its `exit_code` (the check's verdict depends on it).
+- `hc run --no-notify` keeps the check's exit note out of the lead's input. Its exit may still wake
+  `hco wait` as child news; that is harmless (it shows as a `(name)` process row).
+- `hc send <t> "<one line>"` exits non-zero when the text was not delivered (`hco send` then puts the
+  report files back). If it can fail after delivering, the worker would have the message but find its
+  old STATUS restored.
+- `hc wait --children any` from a terminal without children fails with exit 7 / `needs_target`. If it
+  waits silently instead, an adopted run still polls, because that is decided from `run.json`.
+- A message sent to a worker mid-turn (`adopt`) is queued by the agent rather than disturbing its turn.
+
+### Tests
+`tests/test_hco_flow.py`: 52 new tests (`RunState`, `Check`, `Accept`, `FollowUp`, `NextStep`, `Restart`,
+`Plan`, `Units`); 173 in total, 17 of them live tests that skip without `hc`. The fake hc gained `send`,
+`wait <t>` (runs a check terminal's command), a request lock like the real core, and knobs for failing or
+slow `run`, refused `send` and `needs_target`. Mutation-checked, each caught by a test: no rollback, merge
+gate off, stale check counted as passed, accept ignoring the tree, no report rotation, no round limit,
+no overlap check, dependencies ignored, `max_parallel` ignored, tree id built in the real index, polling
+never chosen, a check counting although files moved under it.
+
+### Not done
+- `hco check` for `--on` workers; telling a remote worker its new lead in `adopt`.
+- `hc-orchestrate-workflow.html` does not show the new commands yet.
+- Board mode is untouched.
+
 ## Scope check (`--scope`) — live test on hc 0.1.18, Claude Code worker
 
 A writer's scope used to be prose in PLAN.md and its brief; `merge --dry-run` listed the files and

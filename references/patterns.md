@@ -41,9 +41,12 @@ Review brief essentials: the diff to review (`git diff <base>...HEAD` in that
 worktree), what "correct" means, severity scale, **read-only** (report, don't
 fix), findings as `file:line — problem — why — suggested fix` in RESULT.md.
 
-Then send the builder only the findings you agree with:
-`hc send k3x9-build "Address these review findings: <path to rev1 RESULT.md>, items 1, 3, 4. Skip 2: <reason>."`
-Stop after 2 rounds; leftover disagreements go to the user.
+Then send the builder only the findings you agree with, as a counted round:
+`hco send --run k3x9 --name build --text "Address these review findings: <path to rev1 RESULT.md>, items 1, 3, 4. Skip 2: <reason>."`
+It keeps round 1's STATUS and RESULT.md under `.r1` names, so `DONE` in the table always
+means the current round. After two follow-ups it exits 4: leftover disagreements go to the user.
+Give the builder a `--check`; `hco check` then reruns it after every round and `merge` holds
+the branch until it passed on the final files.
 
 Swap vendors when Codex built it. `collect` flags a reviewer that edited files.
 
@@ -81,6 +84,29 @@ hco spawn --run k3x9 --name impl --agent codex --role implement --worktree \
 Verify each stage before starting the next; a bad research step poisons
 everything after it. Kill finished stages (`hc kill`) to free resources, but
 keep their outboxes.
+
+As a plan, `hco advance` starts each stage when the one before it holds, and puts the
+earlier RESULT.md paths into the next brief itself:
+
+```json
+{"workers": [
+  {"name": "research", "agent": "claude", "role": "research", "brief": "research.md"},
+  {"name": "impl", "agent": "codex", "brief": "impl.md", "worktree": true,
+   "scope": ["src/**", "tests/**"], "check": "npm test", "after": ["research"]},
+  {"name": "rev", "agent": "claude", "role": "review", "brief": "rev.md",
+   "cwd": "@impl", "after": ["impl:done"]}]}
+```
+
+```sh
+hco plan --run k3x9 --file plan.json && hco advance --run k3x9     # starts research
+# research DONE: read its RESULT.md, then
+hco accept --run k3x9 --name research --note "checked the three API claims against the source"
+hco advance --run k3x9                                             # starts impl
+hco check --run k3x9 --name impl && hco advance --run k3x9         # check passed: starts rev
+```
+
+`after: ["research"]` waits for your `accept`, which is the "verify each stage" rule as a
+gate. Use `:done` only where the next stage is itself the verification (a reviewer).
 
 ## 5. Watcher — long-running processes without blocking
 
