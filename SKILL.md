@@ -250,7 +250,9 @@ orchestrator reacts to events. Use the normal flow above for agent work. Propose
 plan table; start it only after the user approves.
 
 1. Write `spec.json`: `question`, `cases`, `variants`, `job_cmd` (argv list with `{case} {variant} {out}
-   {job} {exp} {attempt}`), `max_workers`, `max_attempts`, optional `pre`, `out_dir`, `job_timeout_s`.
+   {job} {exp} {attempt}`), `max_workers`, `max_attempts`, optional `pre`, `out_dir`, `job_timeout_s`,
+   `retry_delay_s` (a failed job waits before its retry, doubling each time: set it when failures can be
+   transient, e.g. rate limits) and `pairs` (`[[case, variant], ...]` for a grid with holes).
    `job_cmd` must be safe to run twice and must not touch the mainframe (zowe is refused). Keep secrets
    out of the spec and docs: the store is unencrypted.
 2. `python3 <skill-dir>/scripts/hcboard.py init <exp> --spec spec.json` (exit 4 = this hc has no doc
@@ -258,14 +260,22 @@ plan table; start it only after the user approves.
    experiment: `init e052 --spec s.json --parent e051 --delta '{"macros":true}'`; never edit a running
    experiment's `pre`.
 3. `hc run --bg --name <exp>-orch --outlive-parent --cwd "$PWD" -- python3 <skill-dir>/scripts/hcboard.py run <exp>`
-   starts the orchestrator (workers, crash requeue, retries, export, cleanup). Supervise with
+   starts the orchestrator (workers, crash requeue, retries, export, cleanup). It first checks what would
+   otherwise fail late (`--cwd` is a git repo that can commit `experiments/<exp>.json`, `job_cmd` can start)
+   and exits 2 with the reason before any job runs. Supervise with
    `hc wait <exp>-orch --timeout 100` and `hc read <exp>-orch --lines 40`; it prints JSON events and ends
    with `HCBOARD <exp> COMPLETE done=N failed=M`. It writes and commits `experiments/<exp>.json`, then
    deletes the docs.
-4. `hcboard.py status <exp>`, `pause <exp>`, `resume <exp>`. If the orchestrator died, run step 3 again:
-   it reconciles from the docs. One orchestrator per experiment.
+4. `hcboard.py status <exp>` (counts, time per job, a rough time left, totals per variant), `pause <exp>`,
+   `resume <exp>`. `cancel <exp>` stops it for good: the orchestrator kills its workers and their jobs,
+   marks unfinished jobs failed (`cancelled`), exports and archives (last line ends `CANCELLED`); ask the
+   user before cancelling. If the orchestrator died, run step 3 again: it reconciles from the docs. One
+   orchestrator per experiment.
 5. Verify as in phase 4: read `experiments/<exp>.json` and the job outputs under `runs/<exp>/`; a job doc
    is a claim, and failed jobs carry their error. Report failures to the user.
+6. Failed jobs, once their cause is fixed: `hcboard.py init <new-exp> --retry-failed <exp>` makes a child
+   experiment of only those jobs from the export (add `--spec` to change `job_cmd` or limits), then step 3.
+   Never rerun the whole grid for a few failures.
 
 Board terminals carry labels `exp=<exp>`, `role=worker`, `hco.board=<exp>`: touch only those. Details,
 verified hc behavior and limits: `references/hc-docstore-notes.md`; hc basics: `hc --skill`.

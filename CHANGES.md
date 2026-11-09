@@ -3,6 +3,52 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Board mode: fail early, cancel, retry only what failed — fake-core tests only, NOT live-tested
+
+### Found and fixed
+- **A run could do all its work and then fail at the last step.** The export is committed at the end; in a
+  folder that is not a git repo, with `experiments/` ignored, or without a git identity, that commit failed
+  after every job had run. A `job_cmd` that could not start failed every job `max_attempts` times and the run
+  "completed". `run` now checks both before it starts anything and exits 2 with the reason.
+- **Reads grew with the square of the job count.** Each claim made the worker re-read every job from the top,
+  finished ones included, and each doc event made the orchestrator re-read all jobs. 30 jobs with one worker
+  took 806 doc reads; now 372 (about 150 of them fixed cost), growing linearly. See
+  `references/hc-docstore-notes.md` for how the cache is kept honest (timer, `missed`, a confirming full read).
+- **Worker numbering depended on `hc ls` rows carrying `name`.** `references/hc-facts.md` says they don't;
+  this board's live test read `name` from them. I could not check which is true (no hc here). With slim rows
+  the old code named every later worker `<exp>-w1`, so replacing a dead worker failed while w1 lived
+  (reproduced against the fake core in slim mode), and clean exits counted as crashes. Rows are now
+  completed with `hc get` when fields are missing, which is right under either shape.
+
+### Added
+- `hcboard cancel EXP`: there was no way to stop an experiment except `pause` (running jobs continue, docs
+  stay forever) or killing terminals by hand. Cancel kills the experiment's workers and their jobs, fails
+  unfinished jobs as `cancelled`, exports and archives; the last line ends `CANCELLED`.
+- `hcboard init NEW --retry-failed OLD [--spec S]`: finished experiments are archived and their docs deleted,
+  so failed jobs could only be rerun by rerunning the whole grid. This builds a child experiment from the
+  failed jobs in OLD's export. The final output of a run with failures prints the command.
+- Spec `retry_delay_s`: a failed job waits (delay, doubling, at most 10 min) before its retry instead of
+  burning all attempts within seconds; the worker stays alive meanwhile. Default off: behavior unchanged.
+- Spec `pairs`: an explicit list of (case, variant) jobs instead of the full grid.
+- `status`: time so far, mean time per finished job, a rough time left, retried attempts, totals per
+  variant (`stats` and `variants` in `--json`).
+- `tests/fake_core.py` and `tests/test_hcboard_offline.py`: the orchestrator, worker and `hcdoc` now run end
+  to end without hc (a file-backed doc store with compare-and-set and events, plus `ls/get/run/kill/rm`
+  that really start and signal processes). Before this, everything but pure functions was covered only by
+  the live tests, which CI skips. 21 tests: full run, crash requeue, pause/resume, and everything above.
+
+### Tests and limits
+- 194 tests in total; 17 live ones skip without `hc`. Mutation-checked (each caught): start-up checks off,
+  cancel without kill, cancel ignored, slim rows not completed, delay not honored, worker exiting instead
+  of waiting, worker cache off, orchestrator cache off, no confirming full read, `missed` keeping the
+  cache, retry taking every job.
+- The fake core follows `references/hc-docstore-notes.md` (A1-A12) but is not the core. Not confirmed live:
+  that `hc kill` on a worker reaches its SIGHUP handler exactly as the notes describe (cancel relies on it
+  to stop the job's process group), and event timing under load.
+- Not done: OSC 7501 status for the orchestrator and workers (the format is now on herdr.dev/core; its effect
+  on `hc wait` needs a live check), requeue of remote owners, more than one orchestrator per experiment,
+  the HTML guide.
+
 ## Run state, plans, checks and rounds — fake-hc tests only, NOT live-tested
 
 The agent flow kept its coordination in the lead's head: dependencies were prose in PLAN.md, "verified"

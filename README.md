@@ -176,7 +176,14 @@ after you approve; without it the skill behaves as above.
 - **Ends tidy.** Export to `experiments/<exp>.json`, git commit, manifest `archived`,
   docs deleted (their versions are kept), finished worker terminals removed.
 - **Lineage.** A rerun with changed preconditions is a new experiment:
-  `init e052 --spec s.json --parent e051 --delta '{"macros":true}'`.
+  `init e052 --spec s.json --parent e051 --delta '{"macros":true}'`. To rerun only what failed:
+  `init e052 --retry-failed e051` builds the child from the failed jobs in `experiments/e051.json`.
+- **Fails early, stops cleanly.** `run` refuses before the first job when the export could not be
+  committed at the end (not a git repo, path ignored, no git identity) or `job_cmd` can't start.
+  `hcboard cancel` kills the experiment's workers and their jobs, fails what is unfinished as
+  `cancelled`, then exports and archives like a normal end.
+- **Retries can wait.** With `retry_delay_s` a failed job is not retried at once but after the delay,
+  doubled per attempt (at most 10 minutes); the worker stays alive while it waits.
 
 ```mermaid
 flowchart TB
@@ -222,6 +229,9 @@ stateDiagram-v2
     planned --> running: hcboard run
     running --> paused: hcboard pause
     paused --> running: hcboard resume
+    running --> cancelled: hcboard cancel
+    paused --> cancelled: hcboard cancel
+    cancelled --> done: workers killed, open jobs failed
     running --> done: every job done or failed
     done --> archived: exported + committed, docs deleted
     archived --> [*]
@@ -248,13 +258,19 @@ S=~/.claude/skills/hc-orchestrate/scripts
 python3 $S/hcboard.py init e051 --spec spec.json        # job docs + manifest (planned)
 hc run --bg --name e051-orch --outlive-parent --cwd "$PWD" -- python3 $S/hcboard.py run e051
 hc wait e051-orch --timeout 100; hc read e051-orch --lines 40
-python3 $S/hcboard.py status e051      # also: pause e051 | resume e051
+python3 $S/hcboard.py status e051      # also: pause e051 | resume e051 | cancel e051
+python3 $S/hcboard.py init e052 --retry-failed e051     # afterwards: only e051's failed jobs
 ```
 
 `spec.json`: `question`, `cases`, `variants`, `job_cmd` (argv with `{case} {variant}
 {out} {job} {exp} {attempt}`), `max_workers`, `max_attempts`, optional `pre`, `out_dir`,
-`job_timeout_s`. Needs an hc whose core has `doc.get`/`doc.set` (checked at `init`; exit 4
+`job_timeout_s`, `retry_delay_s`, and `pairs` (`[[case, variant], ...]` instead of the full
+grid). Needs an hc whose core has `doc.get`/`doc.set` (checked at `init`; exit 4
 otherwise, then use the normal flow).
+
+`status` also prints the time so far, the mean time per finished job, a rough time left
+(unfinished jobs × mean ÷ workers) and done/failed/open per variant; `--json` has the same
+under `stats` and `variants`.
 
 Rules and guards: `job_cmd` must be safe to run twice (delivery is at-least-once);
 docs are unencrypted, so no secrets in specs or docs; only `sk-` docs are touched and
@@ -463,5 +479,7 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
   remote folder's trust prompt must be accepted by you (`hc attach machine/t7`).
 - Board mode (live-tested on hc 0.1.17 in an isolated session, with a fake job): one
   orchestrator per experiment; remote owners (`machine/t7`) are never requeued; workers
-  emit no OSC 7501 status (the report format is not in `hc --skill`), they print progress
-  lines instead; every reconcile re-reads all job docs (fine for hundreds).
+  emit no OSC 7501 status, they print progress lines instead. Between two `--poll` timers the
+  orchestrator re-reads only job docs that had an event; the timer re-reads all of them.
+  `cancel`, `--retry-failed`, `retry_delay_s`, `pairs`, the start-up checks and the read
+  savings were tested against `tests/fake_core.py` only, not against a real core.
