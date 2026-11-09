@@ -76,6 +76,24 @@ and dependencies.
 Show the user the plan as a short table and ask to proceed, unless the task
 text already says to go ahead.
 
+**The plan as data.** With three or more workers, or any worker that waits for another,
+also write the rows as `plan.json` and let `hco` start them in order:
+
+```json
+{"max_parallel": 4, "workers": [
+  {"name": "build", "agent": "claude", "brief": "build.md", "worktree": true,
+   "scope": ["src/api/**"], "check": "pytest tests/api -q", "deadline_min": 30},
+  {"name": "rev", "agent": "codex", "role": "review", "brief": "rev.md",
+   "cwd": "@build", "after": ["build:done"]},
+  {"name": "docs", "agent": "claude", "brief": "docs.md", "worktree": true,
+   "scope": ["docs/**"], "check": "make docs", "after": ["build:merged"]}]}
+```
+
+`after` waits for `name:done` (it reported DONE and its check passed), `name` alone
+(= `:accepted`, you ran `hco accept`) or `name:merged`. `cwd: "@build"` is that worker's
+folder; other keys are `hco spawn`'s options. `hco plan --run <run> --file plan.json`
+refuses cycles, unknown names and parallel writers whose scopes may share a file.
+
 ## 2. Start workers
 
 `hco init --task "<one line>"` prints the run id. For each worker write a
@@ -87,6 +105,11 @@ brief guide in `references/patterns.md`) then:
 hco spawn --run <run> --name api --agent claude --role implement --worktree \
   --scope 'src/api/**' 'tests/api/**' --brief api-task.md
 ```
+
+With a stored plan, `hco advance --run <run>` replaces the `spawn` calls: it starts every
+worker whose `after` holds (up to `max_parallel`), adds the earlier workers' RESULT.md
+paths to its brief, and prints what still waits and why. Run it again after each
+`accept` or `merge`; `"complete": true` means every planned worker ran and was accepted.
 
 `spawn` wraps the body in the worker contract (scope, no sub-agents, report
 protocol, policy). Give every writer `--scope`: patterns relative to the repo root
@@ -102,6 +125,12 @@ Reviewers and researchers take none. Read its JSON after each spawn:
 - Name clash: pick another name; never kill strangers.
 - `--trust` pre-accepts the folder-trust prompt for that worker's folder (edits the user's agent
   config). Use it only when the user asked for it or already trusts the folder.
+- `--check '<cmd>'`: the command that proves the work (exit 0 = pass). It goes into the brief,
+  `hco check` runs it, and `merge` refuses the worker until it passed on the files as they are.
+  Give every writer one. `--deadline <min>` flags a round that runs long (nothing is killed).
+- Several `spawn` calls at once are safe. A spawn that fails removes its worktree and branch
+  again, so the same name can be retried.
+- For a long run add `--outlive`: the workers then survive your restart (see phase 6).
 
 Start dependent workers only after their inputs are verified (phase 4), with
 the upstream RESULT.md path in their brief.
@@ -109,7 +138,9 @@ the upstream RESULT.md path in their brief.
 ## 3. Supervise
 
 Repeat `hco wait --run <run> --timeout 100` until every worker is resolved. It
-returns on the next news and prints a status table.
+returns on the next news and prints a status table. Its `NEXT` column applies the table
+below to each worker (`wait`, `run check`, `verify, then accept`, `merge`, `person must
+answer`, ...): a hint from hc's state and the STATUS file, not a verdict.
 
 | signal | do |
 |---|---|
@@ -123,6 +154,13 @@ returns on the next news and prints a status table.
 
 Steer with `hc send <t> "..."` (`--if idle` to send only between turns),
 `hc interrupt <t>`, `hc read <t> --lines 100`. Do useful work meanwhile.
+
+After a worker has reported, send corrections as a **round**, not as a bare `hc send`:
+`hco send --run <run> --name <n> --text "<the concrete error>"` (or `--file findings.md`).
+It writes the text to `FOLLOWUP.r<n>.md` in the outbox, moves the old STATUS and RESULT.md
+aside (`STATUS.r1`, `RESULT.r1.md`) so the table can't show a stale `DONE`, drops your
+earlier `accept`, and counts rounds: after 3 (the first task plus two follow-ups) it exits 4
+and you report to the user.
 
 Reporting caveats: in `--permissions safe`, Codex's sandbox blocks `hc send`, so its
 reports reach you as STATUS/RESULT.md files plus hc's status events, not as messages
@@ -139,14 +177,22 @@ reports reach you as STATUS/RESULT.md files plus hc's status events, not as mess
   A worker that reports `BLOCKED: needs <path> (outside my scope)`: give the file to
   another worker, or widen this one (`hco scope --run <run> --name <n> --add <path>`
   prints the `hc send` go-ahead to use).
-- Run tests/builds in hc, not your shell:
+- `hco check --run <run> --name <n>` runs the worker's `--check` in its folder, in an hc
+  terminal, and records the result with the exact content it ran on (exit 0 passed, 1 failed
+  with the log tail, 124 still running: run it again). `--cmd '<cmd>'` sets or replaces the
+  check. A pass stops counting as soon as a file changes. Local workers only.
+- Other tests/builds also run in hc, not your shell:
   `hc run --bg --rm --no-notify --name <run>-test --cwd <dir> -- <cmd>`, then
   `hc wait <run>-test --timeout 100` and `hc read <run>-test --lines 60`
   (drop `--rm` to read after exit).
 - For important changes add a cross-vendor reviewer (role `review`, pointed at
   the diff) before accepting.
-- On failure send the worker the concrete error; at most 2 rounds per worker,
-  then report it to the user.
+- On failure send the worker the concrete error with `hco send` (phase 3); at most 2
+  follow-up rounds per worker, then report it to the user.
+- When you have checked a worker's claims: `hco accept --run <run> --name <n> --note "<how>"`.
+  It refuses a STATUS other than DONE, a check that hasn't passed on the current files, files
+  outside the scope and a reviewer that changed files (`--force` records the override).
+  `accept` is your verdict, not a substitute for looking; planned workers wait for it.
 
 ## 5. Integrate
 
@@ -162,6 +208,9 @@ artifact, a scratch file) from the worktree; if it belongs in the change, widen 
 scope with `hco scope --add` or pass `--ignore-scope` and say why in your report. `init`
 already keeps common check artifacts (`__pycache__/`, `*.pyc`, `.pytest_cache/`,
 `node_modules/`, `.DS_Store`, …) out via `.git/info/exclude`.
+`merge` also refuses a worker whose check has not passed on its current files, or whose
+files changed after you accepted it (`NOT VERIFIED`, exit 1, nothing committed): run the
+check or accept again; `--skip-checks` only if you verified it another way, and say so.
 For each worker it commits the worktree's changes as `hco <run>/<name>`, then
 `git merge --no-ff`s `hco/<run>/<name>` into the current branch. It refuses a
 root with uncommitted tracked changes, and on a conflict it aborts that merge,
@@ -174,7 +223,9 @@ unless asked.
 
 Tell the user briefly: what was done and by whom (with paths), what you verified
 and how (commands, outcomes), and what is unverified, failed or needs a decision.
-Then, once they have what they need:
+`hco report --run <run>` gives the recorded facts as Markdown (per worker: rounds, STATUS,
+check, accept, merge commit; then the journal as a timeline; also `hco log`). It lists what
+`hco` recorded, so add what you verified by other means. Then, once they have what they need:
 
 ```sh
 hco cleanup --run <run>              # kill + rm this run's terminals, archive outboxes
@@ -183,9 +234,13 @@ hco cleanup --run <run> --worktrees  # also remove clean, merged worktrees
 ```
 Branches are kept. If the user wants to inspect a worker, leave its terminal.
 
-If you were restarted: workers end with their lead unless spawned with
-`--outlive`. `hco status --run <run>` and `hc ls --label hco.run=<run>` show
-what survived; continue from phase 3.
+If you were restarted (new terminal or lost context): `hco runs` lists this repo's runs.
+Workers end with their lead unless spawned with `--outlive`. `hco status --run <run>` and
+`hc ls --label hco.run=<run>` show what survived. If your `$HC_TERMINAL_ID` changed, run
+`hco adopt --run <run>`: it records you as the lead, rewrites the address in the workers'
+briefs and tells each live local worker where to report. Workers you did not start are not
+your hc children, so `hco wait` then polls their state and STATUS files instead (same
+output). Continue from phase 3; with a plan, `hco advance` picks up where it stopped.
 
 ## Board mode (batch jobs on the doc store)
 
@@ -195,7 +250,9 @@ orchestrator reacts to events. Use the normal flow above for agent work. Propose
 plan table; start it only after the user approves.
 
 1. Write `spec.json`: `question`, `cases`, `variants`, `job_cmd` (argv list with `{case} {variant} {out}
-   {job} {exp} {attempt}`), `max_workers`, `max_attempts`, optional `pre`, `out_dir`, `job_timeout_s`.
+   {job} {exp} {attempt}`), `max_workers`, `max_attempts`, optional `pre`, `out_dir`, `job_timeout_s`,
+   `retry_delay_s` (a failed job waits before its retry, doubling each time: set it when failures can be
+   transient, e.g. rate limits) and `pairs` (`[[case, variant], ...]` for a grid with holes).
    `job_cmd` must be safe to run twice and must not touch the mainframe (zowe is refused). Keep secrets
    out of the spec and docs: the store is unencrypted.
 2. `python3 <skill-dir>/scripts/hcboard.py init <exp> --spec spec.json` (exit 4 = this hc has no doc
@@ -203,14 +260,22 @@ plan table; start it only after the user approves.
    experiment: `init e052 --spec s.json --parent e051 --delta '{"macros":true}'`; never edit a running
    experiment's `pre`.
 3. `hc run --bg --name <exp>-orch --outlive-parent --cwd "$PWD" -- python3 <skill-dir>/scripts/hcboard.py run <exp>`
-   starts the orchestrator (workers, crash requeue, retries, export, cleanup). Supervise with
+   starts the orchestrator (workers, crash requeue, retries, export, cleanup). It first checks what would
+   otherwise fail late (`--cwd` is a git repo that can commit `experiments/<exp>.json`, `job_cmd` can start)
+   and exits 2 with the reason before any job runs. Supervise with
    `hc wait <exp>-orch --timeout 100` and `hc read <exp>-orch --lines 40`; it prints JSON events and ends
    with `HCBOARD <exp> COMPLETE done=N failed=M`. It writes and commits `experiments/<exp>.json`, then
    deletes the docs.
-4. `hcboard.py status <exp>`, `pause <exp>`, `resume <exp>`. If the orchestrator died, run step 3 again:
-   it reconciles from the docs. One orchestrator per experiment.
+4. `hcboard.py status <exp>` (counts, time per job, a rough time left, totals per variant), `pause <exp>`,
+   `resume <exp>`. `cancel <exp>` stops it for good: the orchestrator kills its workers and their jobs,
+   marks unfinished jobs failed (`cancelled`), exports and archives (last line ends `CANCELLED`); ask the
+   user before cancelling. If the orchestrator died, run step 3 again: it reconciles from the docs. One
+   orchestrator per experiment.
 5. Verify as in phase 4: read `experiments/<exp>.json` and the job outputs under `runs/<exp>/`; a job doc
    is a claim, and failed jobs carry their error. Report failures to the user.
+6. Failed jobs, once their cause is fixed: `hcboard.py init <new-exp> --retry-failed <exp>` makes a child
+   experiment of only those jobs from the export (add `--spec` to change `job_cmd` or limits), then step 3.
+   Never rerun the whole grid for a few failures.
 
 Board terminals carry labels `exp=<exp>`, `role=worker`, `hco.board=<exp>`: touch only those. Details,
 verified hc behavior and limits: `references/hc-docstore-notes.md`; hc basics: `hc --skill`.

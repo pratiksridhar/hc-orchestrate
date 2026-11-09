@@ -2,13 +2,19 @@
 """hcboard: experiment board orchestrator on herdr-core's doc store (needs hcdoc.py, docstore_worker.py).
 
   init   EXP --spec SPEC.json [--parent P --delta JSON]   write job docs + manifest (state planned)
+  init   EXP --retry-failed P [--spec SPEC.json]           a new experiment with only P's failed jobs, read
+                                                           from experiments/P.json (P stays as it is)
   run    EXP [--cwd D] [--poll S] [--no-commit]            the orchestrator loop; run it in an hc terminal
-  status EXP [--json]                                      counts and a job table
+  status EXP [--json]                                      counts, timing, per-variant totals and a job table
   pause  EXP | resume EXP                                  flip the manifest between running and paused
+  cancel EXP                                               stop it: the orchestrator kills its workers, fails
+                                                           the unfinished jobs as "cancelled" and archives
 
 SPEC.json: {"question": str, "variants": [str], "cases": [str], "job_cmd": [str, ...],
-            "max_workers": 3, "max_attempts": 3, "pre": {...}, "out_dir": "runs/<exp>", "job_timeout_s": N}
-job_cmd placeholders: {case} {variant} {out} {job} {exp} {attempt}. One job per case x variant.
+            "max_workers": 3, "max_attempts": 3, "pre": {...}, "out_dir": "runs/<exp>", "job_timeout_s": N,
+            "retry_delay_s": N, "pairs": [[case, variant], ...]}
+job_cmd placeholders: {case} {variant} {out} {job} {exp} {attempt}. One job per case x variant, or, with
+"pairs", one per listed pair. retry_delay_s: a failed job waits before its retry (doubling, max 10 min).
 
 `run` starts workers (labels exp=<id>, role=worker, hco.board=<id>), subscribes to doc and terminal
 events before it reads anything, and reconciles (re-read every doc, compare owners with the live
@@ -27,6 +33,7 @@ import json
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -34,13 +41,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import hcdoc  # noqa: E402
-from docstore_worker import refuse_mainframe  # noqa: E402
+from docstore_worker import PLACEHOLDER, refuse_mainframe  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 HC = os.environ.get("HCBOARD_HC", "hc")
 EXP_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,15}$")
 FINAL = ("done", "failed")
-MANIFEST_STATES = ("planned", "running", "paused", "done", "archived")
+MANIFEST_STATES = ("planned", "running", "paused", "cancelled", "done", "archived")
 MIN_RECONCILE_GAP = 0.4  # seconds: coalesce bursts of events into one reconcile
 MAX_BAD_EXITS = 10  # workers dying with no job finishing in between => give up
 
@@ -110,6 +117,37 @@ def by_variant(jobs):
     return out
 
 
+def fmt_secs(s):
+    s = int(s)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def stats(jobs, max_workers, now_ms):
+    """Timing from the job docs: elapsed since the first start, mean seconds per finished job, and a rough
+    time left (unfinished jobs x mean / workers). None where there is nothing to go on yet."""
+    live = [v for v in jobs.values() if v]
+    starts = [v["started_ms"] for v in live if type(v.get("started_ms")) is int]
+    took = [(v["finished_ms"] - v["started_ms"]) / 1000 for v in live
+            if v.get("state") in FINAL and type(v.get("started_ms")) is int and type(v.get("finished_ms")) is int
+            and v["finished_ms"] >= v["started_ms"]]
+    left = sum(1 for v in live if v.get("state") not in FINAL)
+    mean = sum(took) / len(took) if took else None
+    return {"elapsed_s": round((now_ms - min(starts)) / 1000, 1) if starts else None,
+            "mean_job_s": round(mean, 1) if mean is not None else None,
+            "eta_s": round(left * mean / max(1, min(max_workers, left)), 1) if mean is not None and left else
+            (0 if not left else None), "retries": sum(max(0, v.get("attempt", 0) - 1) for v in live)}
+
+
+def cancel_mutation(v):
+    """Fail a job that has not finished; a job that finished meanwhile is left as it is."""
+    if v.get("state") in FINAL:
+        raise hcdoc.Lost("already final")
+    v["state"] = "failed"
+    v.setdefault("result", {})["error"] = "cancelled"
+    v["finished_ms"] = hcdoc.now_ms()
+    return v
+
+
 # ------------------------------------------------------------------ plumbing
 
 
@@ -165,24 +203,78 @@ def read_spec(path):
             spec = json.load(f)
     except (OSError, ValueError) as e:
         raise hcdoc.BadInput(f"cannot read spec {path}: {e}")
+    if not isinstance(spec, dict):
+        raise hcdoc.BadInput(f"spec {path} must be a JSON object")
+    return check_spec(spec)
 
-    def strs(key):
-        v = spec.get(key)
+
+def check_spec(spec):
+    """Validate a spec and fill defaults. Returns (spec, cases, variants, job_cmd, pairs)."""
+    def strs(key, v):
         if not (isinstance(v, list) and v and all(isinstance(x, str) and x and len(x) <= 200 for x in v)):
             raise hcdoc.BadInput(f"spec.{key} must be a non-empty list of short strings")
         return v
 
-    cases, variants, cmd = strs("cases"), strs("variants"), strs("job_cmd")
+    pairs = spec.get("pairs")
+    if pairs is not None:
+        if not (isinstance(pairs, list) and pairs and all(
+                isinstance(x, list) and len(x) == 2 and all(isinstance(y, str) and y and len(y) <= 200 for y in x)
+                for x in pairs)):
+            raise hcdoc.BadInput('spec.pairs must be a non-empty list of ["case", "variant"] pairs')
+        pairs = [tuple(x) for x in pairs]
+        if len(set(pairs)) != len(pairs):
+            raise hcdoc.BadInput("spec.pairs lists a pair twice")
+        spec.setdefault("cases", list(dict.fromkeys(c for c, _ in pairs)))
+        spec.setdefault("variants", list(dict.fromkeys(v for _, v in pairs)))
+    cases, variants, cmd = strs("cases", spec.get("cases")), strs("variants", spec.get("variants")), \
+        strs("job_cmd", spec.get("job_cmd"))
+    if pairs is None:
+        pairs = [(c, v) for c in cases for v in variants]
+    elif any(c not in cases or v not in variants for c, v in pairs):
+        raise hcdoc.BadInput("spec.pairs names a case or variant that spec.cases / spec.variants does not list")
     refuse_mainframe(cmd)
     for key, lo, hi, default in (("max_workers", 1, 16, 3), ("max_attempts", 1, 10, 3)):
         v = spec.setdefault(key, default)
         if type(v) is not int or not lo <= v <= hi:
             raise hcdoc.BadInput(f"spec.{key} must be an integer {lo}..{hi}")
+    for key in ("job_timeout_s", "retry_delay_s"):
+        v = spec.get(key)
+        if v is not None and (type(v) not in (int, float) or v < 0 or (key == "job_timeout_s" and v == 0)):
+            raise hcdoc.BadInput(f"spec.{key} must be a number of seconds" + (" above 0" if key == "job_timeout_s" else ""))
     if not isinstance(spec.get("question"), str):
         raise hcdoc.BadInput("spec.question must be a string")
     if not isinstance(spec.setdefault("pre", {}), dict):
         raise hcdoc.BadInput("spec.pre must be an object")
-    return spec, cases, variants, cmd
+    return spec, cases, variants, cmd, pairs
+
+
+def spec_from_failed(parent, export_path, override):
+    """A spec for rerunning the failed jobs of an exported experiment: the parent's manifest settings
+    (or `override`, a spec the caller read) with `pairs` set to the failed (case, variant) pairs."""
+    try:
+        with open(export_path, encoding="utf-8") as f:
+            dump = json.load(f)
+        manifest, jobs = dump["manifest"], dump["jobs"]
+        if dump.get("exp") != parent or not isinstance(manifest, dict) or not isinstance(jobs, dict):
+            raise ValueError(f"not an export of {parent}")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise hcdoc.BadInput(f"cannot use {export_path} as the export of {parent}: {e}. An experiment is "
+                             "exported when it finishes; pass --export PATH if the file is elsewhere")
+    failed = [[v.get("case"), v.get("variant")] for _, v in sorted(jobs.items())
+              if isinstance(v, dict) and v.get("state") == "failed"]
+    if not failed:
+        raise hcdoc.BadInput(f"{parent} has no failed jobs; nothing to retry")
+    spec = dict(override) if override is not None else {
+        k: manifest[k] for k in ("question", "pre", "job_cmd", "max_workers", "job_timeout_s", "retry_delay_s")
+        if k in manifest}
+    if override is None:
+        tries = [v.get("max_attempts") for v in jobs.values() if isinstance(v, dict)]
+        if tries and type(tries[0]) is int:
+            spec["max_attempts"] = tries[0]
+    spec.pop("cases", None)
+    spec.pop("variants", None)
+    spec["pairs"] = failed
+    return spec
 
 
 # ------------------------------------------------------------------ commands
@@ -196,6 +288,11 @@ def check_exp(exp):
 
 def cmd_init(a):
     exp = check_exp(a.exp)
+    if a.retry_failed and a.parent and a.parent != a.retry_failed:
+        raise hcdoc.BadInput("--retry-failed already names the parent; drop --parent")
+    if not a.retry_failed and not a.spec:
+        raise hcdoc.BadInput("init needs --spec SPEC.json (or --retry-failed PARENT)")
+    a.parent = a.parent or a.retry_failed
     if a.delta and not a.parent:
         raise hcdoc.BadInput("--delta needs --parent")
     parent = check_exp(a.parent) if a.parent else None
@@ -205,8 +302,16 @@ def cmd_init(a):
         raise hcdoc.BadInput(f"--delta is not JSON: {e}")
     if delta is not None and not isinstance(delta, dict):
         raise hcdoc.BadInput("--delta must be a JSON object")
-    spec, cases, variants, cmd = read_spec(a.spec)
-    pairs = [(c, v) for c in cases for v in variants]
+    if a.retry_failed:
+        if parent == exp:
+            raise hcdoc.BadInput("a retry is a new experiment: give it its own id")
+        export = a.export or os.path.join(a.cwd, "experiments", f"{parent}.json")
+        override = read_spec(a.spec)[0] if a.spec else None
+        spec, cases, variants, cmd, pairs = check_spec(spec_from_failed(parent, export, override))
+        if delta is None:
+            delta = {"retry_failed": len(pairs)}
+    else:
+        spec, cases, variants, cmd, pairs = read_spec(a.spec)
     if len(pairs) > 999:
         raise hcdoc.BadInput(f"{len(pairs)} jobs; the limit is 999")
     mname = hcdoc.check_name(hcdoc.PREFIX + exp)
@@ -227,8 +332,8 @@ def cmd_init(a):
         manifest = {"schema": 1, "exp": exp, "parent": parent, "delta": delta, "question": spec["question"],
                     "pre": spec["pre"], "cases": cases, "variants": variants, "jobs": names, "job_cmd": cmd,
                     "max_workers": spec["max_workers"], "state": "planned"}
-        for key in ("out_dir", "job_timeout_s"):
-            if key in spec:
+        for key in ("out_dir", "job_timeout_s", "retry_delay_s"):
+            if spec.get(key) is not None:
                 manifest[key] = spec[key]
         try:
             sess.set(mname, manifest, mver)
@@ -255,11 +360,40 @@ def cmd_status(a):
     finally:
         sess.close()
     c = counts(jobs)
+    st = stats(jobs, manifest.get("max_workers", 1), hcdoc.now_ms())
     if a.json:
-        print(json.dumps({"manifest": manifest, "counts": c, "jobs": jobs}))
+        print(json.dumps({"manifest": manifest, "counts": c, "stats": st, "variants": by_variant(jobs), "jobs": jobs}))
     else:
         print(f"{mname}  state={manifest.get('state')}  " + "  ".join(f"{k}={v}" for k, v in c.items() if v))
+        if st["elapsed_s"] is not None:
+            print(f"running for {fmt_secs(st['elapsed_s'])}"
+                  + (f", {st['mean_job_s']:g} s per finished job" if st["mean_job_s"] is not None else "")
+                  + (f", about {fmt_secs(st['eta_s'])} left at {manifest.get('max_workers', 1)} worker(s) (rough)"
+                     if st["eta_s"] else "") + (f", {st['retries']} retried attempt(s)" if st["retries"] else ""))
+        for variant, d in sorted(by_variant(jobs).items()):
+            print(f"  {variant:<24} done={d['done']} failed={d['failed']} open={d['other']}")
         print(table(jobs))
+    return hcdoc.OK
+
+
+def cmd_cancel(a):
+    """Mark the experiment cancelled. The orchestrator does the rest on its next reconcile; if none is
+    running, `hcboard.py run EXP` does it."""
+    mname = hcdoc.check_name(hcdoc.PREFIX + check_exp(a.exp))
+
+    def mutate(v):
+        if v.get("state") not in ("planned", "running", "paused"):
+            raise hcdoc.Lost(f"state is {v.get('state')!r}; only a planned, running or paused experiment can be cancelled")
+        v.update(state="cancelled", cancelled=True)
+        return v
+
+    sess = hcdoc.Session()
+    try:
+        sess.update(mname, mutate)
+    finally:
+        sess.close()
+    print(json.dumps({"manifest": mname, "state": "cancelled",
+                      "next": f"the orchestrator stops the workers and archives; if none runs: hcboard.py run {a.exp}"}))
     return hcdoc.OK
 
 
@@ -296,6 +430,10 @@ class Orchestrator:
         self.bad_exits = 0
         self.children = set()
         self.worker_py = str(HERE / "docstore_worker.py")
+        self.jobs = None  # last value read of every job doc
+        self.changed = set()  # job docs with an event since then
+        self.full = True  # the next reconcile re-reads every job doc
+        self.reads = 0  # job docs read, for the `reconciled` event
 
     # -- events
     def start_watch(self):
@@ -327,6 +465,7 @@ class Orchestrator:
             n = m["name"]
             if n == self.mname or n.startswith(self.mname + "-j"):
                 self.dirty = True
+                self.changed.add(n)
             elif re.match(r"^" + re.escape(hcdoc.PREFIX) + r"[a-z0-9_]+$", n) and n not in self.children:
                 self.check_child(n)
         elif kind == "terminal" and m.get("type") in ("finished", "lost"):
@@ -334,7 +473,7 @@ class Orchestrator:
             self.dirty = True
         elif kind == "snapshot" and m.get("reason") == "missed":
             emit("missed")
-            self.dirty = True
+            self.dirty = self.full = True  # events were dropped: the cache can't be trusted
 
     def check_child(self, name):
         try:
@@ -348,7 +487,19 @@ class Orchestrator:
 
     # -- workers
     def workers(self):
-        return hc_json(["ls", "--all", "--json", "--label", f"hco.board={self.exp}"])["terminals"]
+        """This experiment's terminals with name, state and exit_code. Some hc versions list slim rows
+        (address, state, ... but no name or exit_code; see references/hc-facts.md): those are completed
+        with `hc get`, or every worker would be named <exp>-w1 and every exit would count as a crash."""
+        rows = hc_json(["ls", "--all", "--json", "--label", f"hco.board={self.exp}"])["terminals"]
+        out = []
+        for t in rows:
+            if "name" not in t or (t.get("state") == "finished" and "exit_code" not in t):
+                try:
+                    t = {**t, **hc_json(["get", t["address"], "--json"])}
+                except hcdoc.Down:
+                    pass  # gone between ls and get, or get failed: keep the slim row
+            out.append(t)
+        return out
 
     def next_worker_name(self, terms):
         used = [int(m.group(1)) for t in terms if (m := re.match(rf"^{self.exp}-w(\d+)$", t.get("name") or ""))]
@@ -378,11 +529,13 @@ class Orchestrator:
             if bad and t["address"] not in self.seen_bad:
                 self.seen_bad.add(t["address"])
                 self.bad_exits += 1
-        _, manifest, jobs = load(self.sess, self.exp)
+        manifest, jobs = self.read_jobs()
         state = manifest.get("state")
         if state != self.last_state:
             emit("manifest_state", state=state)
             self.last_state = state
+        if state == "cancelled":
+            return self.cancel(terms, jobs)
         for n, v in orphans(jobs, alive):
             ops = requeue_ops(v["owner"], v["attempt"], v.get("max_attempts", 1), f"worker {v['owner']} died")
             try:
@@ -408,6 +561,9 @@ class Orchestrator:
         if self.bad_exits >= MAX_BAD_EXITS:
             raise hcdoc.Fail(f"{self.bad_exits} workers died with no job finishing; giving up (see `hc read` on a worker)")
         if c["pending"] + c["running"] == 0:
+            if self.reads < len(jobs):  # concluded from cached docs: confirm with a full read before finishing
+                self.full = True
+                return self.reconcile()
             return True
         if state == "running":
             running_alive = sum(1 for v in jobs.values() if v and v.get("state") == "running" and v.get("owner") in alive)
@@ -415,6 +571,72 @@ class Orchestrator:
                 if not self.start_worker(terms):
                     break
         return False
+
+    def read_jobs(self):
+        """The manifest and every job doc. After the first full read, only docs that had an event are
+        read again (a full read costs one round trip per job); `missed`, a lost watch and the --poll
+        timer force a full read, so a dropped event is corrected within --poll seconds."""
+        manifest, _ = self.sess.get(self.mname)
+        if manifest is None:
+            raise hcdoc.BadInput(f"{self.mname} does not exist")
+        names = manifest.get("jobs") or []
+        if self.full or self.jobs is None or set(names) != set(self.jobs):
+            todo, self.jobs = names, {}
+        else:
+            todo = [n for n in names if n in self.changed]
+        self.full = False
+        self.changed.clear()  # before reading: an event during the reads below marks the doc again
+        for n in todo:
+            self.jobs[n] = self.sess.get(n)[0]
+        self.reads = len(todo)
+        return manifest, self.jobs  # the cache itself: reconcile's own writes land in it
+
+    def cancel(self, terms, jobs):
+        """The manifest says cancelled: stop this experiment's live workers (each kills its job's process
+        group on SIGHUP), fail every job that has not finished, and let finalize export and archive."""
+        for t in terms:
+            if t.get("state") == "live":
+                subprocess.run([HC, "kill", t["address"]], capture_output=True, timeout=60)
+                emit("worker_killed", terminal=t["address"], name=t.get("name"))
+        n = 0
+        for name, v in jobs.items():
+            if v and v.get("state") not in FINAL:
+                try:
+                    self.sess.update(name, cancel_mutation)
+                    n += 1
+                except hcdoc.Lost:
+                    pass  # it finished on its own just now
+        emit("cancelled", jobs_failed=n)
+        return True
+
+    def preflight(self, manifest):
+        """Fail before any job runs on what would otherwise only fail at the very end (the commit of the
+        export) or on every single job (a job_cmd that can't start)."""
+        if not os.path.isdir(self.cwd):
+            raise hcdoc.BadInput(f"--cwd {self.cwd} is not a folder")
+        cmd = manifest.get("job_cmd") or [""]
+        prog = cmd[0]
+        if isinstance(prog, str) and not PLACEHOLDER.search(prog):
+            path = os.path.join(self.cwd, prog) if "/" in prog else shutil.which(prog)
+            if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                raise hcdoc.BadInput(f"job_cmd starts with {prog!r}, which is not an executable "
+                                     f"{'file under ' + self.cwd if '/' in prog else 'on PATH'}; every job would fail")
+        if not self.commit:
+            return
+        rel = os.path.join("experiments", f"{self.exp}.json")
+
+        def g(*args):
+            return subprocess.run(["git", "-C", self.cwd, *args], capture_output=True, text=True)
+
+        if g("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+            raise hcdoc.BadInput(f"--cwd {self.cwd} is not a git repo, so the export could not be committed at "
+                                 "the end: run in a repo, or pass --no-commit")
+        if g("check-ignore", "-q", "--", rel).returncode == 0:
+            raise hcdoc.BadInput(f"{rel} is ignored by git, so the export could not be committed at the end: "
+                                 "un-ignore it, or pass --no-commit")
+        if g("var", "GIT_COMMITTER_IDENT").returncode != 0:
+            raise hcdoc.BadInput("git has no user.name / user.email here, so the export could not be committed "
+                                 "at the end: set them, or pass --no-commit")
 
     # -- finish
     def finalize(self):
@@ -438,7 +660,11 @@ class Orchestrator:
         for variant, d in sorted(by_variant(jobs).items()):
             print(f"{variant:<24} done={d['done']} failed={d['failed']}")
         emit("archived", removed_workers=removed, out=out)
-        print(f"HCBOARD {self.exp} COMPLETE done={c['done']} failed={c['failed']}", flush=True)
+        if c["failed"] and not manifest.get("cancelled"):
+            print(f"{c['failed']} job(s) failed. After fixing the cause, rerun only those as a new experiment: "
+                  f"hcboard.py init <new-id> --retry-failed {self.exp}")
+        print(f"HCBOARD {self.exp} COMPLETE done={c['done']} failed={c['failed']}"
+              + (" CANCELLED" if manifest.get("cancelled") else ""), flush=True)
         return hcdoc.OK
 
     def git_commit(self, path):
@@ -472,6 +698,8 @@ class Orchestrator:
         mname, manifest, _ = load(self.sess, self.exp)
         if manifest.get("state") == "archived":
             return self.resume_archived(mname, manifest)
+        if manifest.get("state") in ("planned", "running", "paused"):
+            self.preflight(manifest)
         if manifest.get("state") == "planned":
             self.sess.update(mname, lambda v: hcdoc.apply_ops(v, [("if", "state", "planned"), ("set", "state", "running")]))
         self.start_watch()  # subscribe first, then read
@@ -484,11 +712,12 @@ class Orchestrator:
                     emit("watch_restarted")
                     time.sleep(1)
                     self.start_watch()
-                    self.dirty = True
+                    self.dirty = self.full = True
                 elif m:
                     self.on_message(m)
                 now = time.monotonic()
                 if (self.dirty and now - last >= MIN_RECONCILE_GAP) or now >= due:
+                    self.full = self.full or now >= due  # the timer always re-reads everything
                     self.dirty = False
                     last, due = now, now + self.poll
                     if self.reconcile():
@@ -517,9 +746,13 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("init")
     p.add_argument("exp")
-    p.add_argument("--spec", required=True)
+    p.add_argument("--spec", help="SPEC.json (optional with --retry-failed: then the parent's settings are reused)")
     p.add_argument("--parent")
     p.add_argument("--delta", help="JSON object describing what changed from the parent")
+    p.add_argument("--retry-failed", metavar="PARENT",
+                   help="make this experiment from PARENT's failed jobs only (read from its export)")
+    p.add_argument("--export", help="PARENT's export file (default: <cwd>/experiments/PARENT.json)")
+    p.add_argument("--cwd", default=os.getcwd(), help="where experiments/ is (default: here)")
     p = sub.add_parser("run")
     p.add_argument("exp")
     p.add_argument("--cwd", default=os.getcwd(), help="where workers run and experiments/<exp>.json is written (a git repo)")
@@ -529,7 +762,7 @@ def main(argv=None):
     p = sub.add_parser("status")
     p.add_argument("exp")
     p.add_argument("--json", action="store_true")
-    for name in ("pause", "resume"):
+    for name in ("pause", "resume", "cancel"):
         sub.add_parser(name).add_argument("exp")
     a = ap.parse_args(argv)
     orch = None
@@ -542,6 +775,8 @@ def main(argv=None):
             return set_state(a.exp, "running", "paused")
         if a.cmd == "resume":
             return set_state(a.exp, "paused", "running")
+        if a.cmd == "cancel":
+            return cmd_cancel(a)
         orch = Orchestrator(a)
         return orch.run()
     except hcdoc.Conflict as e:

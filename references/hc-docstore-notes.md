@@ -82,7 +82,39 @@ separate mode for deterministic `job_cmd` batches and touches none of this.
 - **Finish order:** manifest `done` -> export -> verify complete -> `git commit` -> `archived` -> delete job
   docs, then manifest -> `hc rm` finished worker terminals. A failed commit stops before any deletion;
   rerunning `run <exp>` resumes (`archived` + export present: only the deletions are redone).
-- **Not done:** OSC 7501 status from workers. `hc --skill` does not give the report format and the core
+- **Reads (added later, fake-core tests only):** the worker remembers jobs it saw `done` or `failed` and skips
+  them when it looks for the next one; before, each claim re-read every finished job (1+2+...+n reads for n
+  jobs). The orchestrator keeps the last value of every job doc and, on a doc event, re-reads only the docs
+  named in events; startup, `missed`, a restarted watcher and the `--poll` timer re-read all, and "every job
+  is final" is confirmed with a full read before finalizing. Measured on the fake core, 30 jobs and one
+  worker: 806 doc reads before, 372 after (about 150 of those are `init`, export and deletion).
+- **Retry delay:** `retry_delay_s` in the manifest. The worker's failure write sets `not_before_ms` =
+  now + delay x 2^(attempt-1), capped at 600 s; `claim_next` skips a pending job until then and reports the
+  shortest wait, and a worker with only waiting jobs sleeps (at most 5 s at a time, so it still sees a pause
+  or cancel) instead of exiting. The guard is in the worker, not in `hcdoc claim`: a manual claim ignores it.
+  A requeue after a worker crash sets no delay.
+- **Cancel:** `hcboard cancel` sets the manifest to `cancelled` with `cancelled: true` (from planned, running
+  or paused). On its next reconcile the orchestrator runs `hc kill` on its live labeled workers (their SIGHUP
+  handler kills the job's process group), fails every job that is not final with error `cancelled` (a job
+  that finished meanwhile is left alone), then finalizes as usual. With no orchestrator running, the next
+  `run` does the same.
+- **Retry failed:** `init NEW --retry-failed OLD` reads `experiments/OLD.json` (the docs are gone by then),
+  takes the failed jobs' (case, variant) pairs and OLD's `job_cmd`, `pre`, `max_workers`, `max_attempts`,
+  `job_timeout_s`, `retry_delay_s` (or a `--spec`), and records `parent: OLD`. `out_dir` is not copied: the
+  new experiment writes to `runs/NEW/`. A spec may list `pairs` directly for a grid with holes.
+- **Start-up checks:** before anything is started `run` verifies that `--cwd` exists, that `job_cmd[0]` is an
+  executable (unless it contains a placeholder) and, unless `--no-commit`, that `--cwd` is inside a git work
+  tree, that `experiments/<exp>.json` is not ignored and that git has a committer identity. Each of these
+  used to surface only after every job had run, at the commit, or as every job failing `max_attempts` times.
+- **`hc ls` row shape:** `references/hc-facts.md` records slim `hc ls --json` rows (no `name`, `labels`,
+  `exit_code`), while this board's live test read `name` from the same command. Whichever holds on a given
+  hc, `workers()` now completes a row that lacks `name` (or a finished row that lacks `exit_code`) with
+  `hc get`. With slim rows the old code named every later worker `<exp>-w1`, so replacing a dead worker
+  failed while w1 was alive, and clean worker exits counted towards the crash limit.
+- **Not done:** OSC 7501 status from workers. (herdr.dev/core now shows the format,
+  `printf '\e]7501;state=blocked:app=my-agent\e\\'`, but how `hc wait` on the orchestrator behaves once it
+  reports a status needs a live core to check, so it is still not emitted.)
+  Earlier note: `hc --skill` does not give the report format and the core
   documentation was not reachable here, so it was not guessed. Workers print progress lines instead
   (`hc read <worker>`).
 - **Limits:** at-least-once delivery; one orchestrator per experiment (two would race on requeues);

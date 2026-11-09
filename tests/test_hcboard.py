@@ -96,7 +96,8 @@ class Spec(unittest.TestCase):
         return p
 
     def test_defaults(self):
-        spec, cases, variants, cmd = hcboard.read_spec(self.spec())
+        spec, cases, variants, cmd, pairs = hcboard.read_spec(self.spec())
+        self.assertEqual(pairs, [("A", "v")])
         self.assertEqual((spec["max_workers"], spec["max_attempts"], spec["pre"]), (3, 3, {}))
 
     def test_rejects_bad_specs(self):

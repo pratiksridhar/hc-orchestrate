@@ -9,8 +9,10 @@ one with hcdoc's CAS claim (owner = $HC_TERMINAL_ID), run the manifest's `job_cm
 
 Every result write is guarded by `owner == me and attempt == mine`, so a worker the orchestrator
 already gave up on cannot overwrite a newer attempt. A failed job goes back to `pending` while
-attempt < max_attempts (this worker may retry it at once), else `failed`. If the worker itself is
-killed, the job stays `running` with a dead owner and the orchestrator requeues it.
+attempt < max_attempts (this worker may retry it at once), else `failed`. With `retry_delay_s` in the
+manifest a retry waits first: delay x 2^(attempt-1), at most 10 minutes, stored as `not_before_ms`; a
+worker that finds only waiting jobs sleeps instead of exiting. If the worker itself is killed, the job
+stays `running` with a dead owner and the orchestrator requeues it.
 
 Delivery is at-least-once: a worker killed after job_cmd finished but before the result write means
 the job runs again, so job_cmd should be idempotent. Output goes to files (runs/<exp>/<job>.json and
@@ -27,6 +29,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import hcdoc  # noqa: E402
@@ -36,6 +39,8 @@ SAFE_DIR = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 MAINFRAME = re.compile(r"\bzowe\b", re.I)  # work policy: no agent-issued mainframe commands
 SUMMARY_MAX = 300
 LOG_TAIL = 300
+MAX_RETRY_DELAY_S = 600
+IDLE_SLEEP_S = 5  # longest nap while every pending job waits for its retry delay (pause/cancel are seen after it)
 
 CHILD = None  # the running job_cmd, so a kill of this worker also stops it
 OWNER = "?"
@@ -114,29 +119,52 @@ def run_command(argv, cwd, log_path, timeout):
             CHILD = None
 
 
-def claim_next(sess, manifest, owner):
+def claim_next(sess, manifest, owner, final=None):
+    """Claim the first pending job that is due. Returns (name, job, wait_ms): wait_ms is how long until
+    the earliest delayed retry is due when nothing could be claimed now, None when nothing is waiting.
+    `final` collects jobs seen done or failed; those never change again, so later scans skip them
+    (without it every claim re-read every finished job: n squared reads over a run)."""
+    final = set() if final is None else final
+    wait_ms = None
     for jname in manifest.get("jobs") or []:
+        if jname in final:
+            continue
         v, _ = sess.get(jname)
+        if isinstance(v, dict) and v.get("state") in ("done", "failed"):
+            final.add(jname)
         if not isinstance(v, dict) or v.get("state") != "pending":
+            continue
+        due = v.get("not_before_ms")
+        if type(due) is int and due > hcdoc.now_ms():
+            if v.get("attempt", 0) < v.get("max_attempts", 1):
+                wait_ms = min(wait_ms, due - hcdoc.now_ms()) if wait_ms is not None else due - hcdoc.now_ms()
             continue
         try:
             _, claimed = sess.update(jname, hcdoc.claim_mutation(owner))
-            return jname, claimed
+            return jname, claimed, None
         except hcdoc.Lost:
             continue  # someone else won it, or its attempts ran out
-    return None, None
+    return None, None, wait_ms
 
 
-def finish_ops(owner, attempt, rc, err, out_path, max_attempts):
+def retry_delay_ms(delay_s, attempt):
+    """Wait before retry number `attempt`+1: delay, doubled per failed attempt, capped at 10 minutes."""
+    if type(delay_s) not in (int, float) or delay_s <= 0:
+        return 0
+    return int(min(delay_s * 2 ** max(0, attempt - 1), MAX_RETRY_DELAY_S) * 1000)
+
+
+def finish_ops(owner, attempt, rc, err, out_path, max_attempts, retry_delay_s=0):
     guard = [("if", "owner", owner), ("if", "attempt", attempt), ("if", "state", "running")]
     if rc == 0:
         return guard + [("set", "state", "done"), ("set", "result.out", out_path if os.path.exists(out_path) else None),
                         ("set", "result.summary", summarize(out_path)), ("set", "result.error", None),
                         ("now", "finished_ms", None)]
     retry = attempt < max_attempts
+    wait = retry_delay_ms(retry_delay_s, attempt) if retry else 0
     return guard + [("set", "state", "pending" if retry else "failed"), ("set", "owner", None if retry else owner),
                     ("set", "result.out", None), ("set", "result.summary", None), ("set", "result.error", err),
-                    ("now", "finished_ms", None)]
+                    ("now", "finished_ms", None)] + ([("set", "not_before_ms", hcdoc.now_ms() + wait)] if wait else [])
 
 
 def run_job(sess, manifest, jname, job, owner):
@@ -161,7 +189,7 @@ def run_job(sess, manifest, jname, job, owner):
             rc, err = 2, str(e)
     if rc != 0 and err is None:
         err = f"exit {rc}: {tail(log_path)}" if os.path.exists(log_path) else f"exit {rc}"
-    ops = finish_ops(owner, attempt, rc, err, out_path, job.get("max_attempts", 1))
+    ops = finish_ops(owner, attempt, rc, err, out_path, job.get("max_attempts", 1), manifest.get("retry_delay_s"))
     try:
         sess.update(jname, lambda v: hcdoc.apply_ops(v, ops))
     except hcdoc.Lost as e:
@@ -187,6 +215,7 @@ def main(argv=None):
     sess = hcdoc.Session()
     try:
         mname = hcdoc.check_name(hcdoc.PREFIX + a.exp)
+        final, told = set(), False
         while True:
             manifest, _ = sess.get(mname)
             if manifest is None:
@@ -195,10 +224,17 @@ def main(argv=None):
             if manifest.get("state") != "running":
                 log(f"manifest is {manifest.get('state')!r}; not claiming")
                 return hcdoc.OK
-            jname, job = claim_next(sess, manifest, a.owner)
-            if jname is None:
+            jname, job, wait_ms = claim_next(sess, manifest, a.owner, final)
+            if jname is None and wait_ms is None:
                 log("no pending jobs; exiting")
                 return hcdoc.OK
+            if jname is None:  # only delayed retries are left: stay, so the orchestrator starts no extra worker
+                if not told:
+                    log(f"every pending job waits for its retry delay ({wait_ms / 1000:.0f} s to the next); waiting")
+                told = True
+                time.sleep(min(max(wait_ms, 0) / 1000 + 0.05, IDLE_SLEEP_S))
+                continue
+            told = False
             run_job(sess, manifest, jname, job, a.owner)
     except hcdoc.Fail as e:
         sys.stderr.write(json.dumps({"error": str(e), "code": e.code}) + "\n")
