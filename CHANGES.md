@@ -3,6 +3,14 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Workflow guide brought up to date
+
+`hc-orchestrate-workflow.html` now covers the changes below that it did not show: plans and `advance`,
+`--scope`, checks, `accept` and the merge gates (with an animated state diagram), follow-up rounds, the
+`NEXT` column, the journal and report, `runs`/`adopt` for a restarted lead, and in board mode `cancel`,
+`--retry-failed`, `retry_delay_s`, `pairs`, the start-up checks and the read savings. Test counts, the
+live-tested hc versions and the "not live-tested" limits match README.md.
+
 ## Board mode: fail early, cancel, retry only what failed — fake-core tests only, NOT live-tested
 
 ### Found and fixed

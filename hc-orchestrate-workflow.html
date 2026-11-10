@@ -334,13 +334,14 @@ document.documentElement.dataset.theme=t||(matchMedia('(prefers-color-scheme: li
     <div class="eyebrow"><span class="blink"></span> skill · claude code · codex · herdr-core</div>
     <h1>hc-orchestrate</h1>
     <p class="tagline">One <b>lead</b>. Many <i>workers</i>. A <u>board</u> that never forgets.</p>
-    <p class="intro">Ask one AI coding agent to build something big and it works slowly, forgets things and checks its own homework. <b>hc-orchestrate</b> lets that agent act as a site manager instead. It makes a plan, hands the pieces to helper agents (<b>workers</b>) that each work in their own terminal, checks what they hand back, and only then puts the pieces together. For large batches of identical jobs there is a second mode, the <a href="#board"><b>board</b></a>, which keeps its to-do list somewhere a crash cannot erase it.</p>
+    <p class="intro">Ask one AI coding agent to build something big and it works slowly, forgets things and checks its own homework. <b>hc-orchestrate</b> lets that agent act as a site manager instead. It makes a plan, hands the pieces to helper agents (<b>workers</b>) that each work in their own terminal, checks what they hand back, and only then puts the pieces together. Each check is recorded, and a piece that has not passed its checks cannot be merged. For large batches of identical jobs there is a second mode, the <a href="#board"><b>board</b></a>, which keeps its to-do list somewhere a crash cannot erase it.</p>
     <p class="intro" style="margin-top:14px;font-size:14.5px">New here? Read straight down. The guide builds the idea one layer at a time, and each layer adds one thing.</p>
     <div class="chips">
       <span class="chip" style="--c:var(--lead)"><b>7</b>phases</span>
       <span class="chip" style="--c:var(--worker)"><b>2</b>vendors, one brief</span>
+      <span class="chip" style="--c:var(--event)"><b>4</b>gates before a merge</span>
       <span class="chip" style="--c:var(--store)"><b>CAS</b>no locks</span>
-      <span class="chip" style="--c:var(--done)"><b>84</b>tests passing</span>
+      <span class="chip" style="--c:var(--done)"><b>194</b>tests</span>
     </div>
     <a class="cue" href="#why">start here ↓</a>
   </div>
@@ -359,6 +360,9 @@ document.documentElement.dataset.theme=t||(matchMedia('(prefers-color-scheme: li
   <a href="#report">Report protocol</a>
   <a href="#signals">Supervision signals</a>
   <a href="#patterns">Patterns</a>
+  <div class="grp">Plans and gates</div>
+  <a href="#plans">Plans, checks &amp; rounds</a>
+  <a href="#restart">A restarted lead</a>
   <div class="grp">Batch jobs</div>
   <a href="#board">Board mode</a>
   <div class="grp">Reference</div>
@@ -418,7 +422,13 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
 <tr><td>lead</td><td>The agent you talk to. It plans, starts workers, checks their work and merges it.</td></tr>
 <tr><td>worker</td><td>A helper agent in its own terminal. It does one piece of the job.</td></tr>
 <tr><td>brief (<code>BRIEF.md</code>)</td><td>The written assignment a worker gets: the goal, which files it may touch, and what “done” means.</td></tr>
-<tr><td>scope</td><td>The files a worker is allowed to change. Anything outside is a defect, even if helpful.</td></tr>
+<tr><td>scope</td><td>The files a worker is allowed to change, given as path patterns (<code>--scope 'src/api/**'</code>). Anything outside is a defect, even if helpful: <code>collect</code> flags it and <code>merge</code> refuses it.</td></tr>
+<tr><td>plan (<code>plan.json</code>)</td><td>The list of workers as data: who runs, with which options, and who waits for whom (<code>after</code>). <code>hco advance</code> starts whatever is ready.</td></tr>
+<tr><td>check</td><td>The command that proves a worker's work, such as <code>pytest tests/api -q</code>. <code>hco check</code> runs it and records the result together with the exact content it ran on.</td></tr>
+<tr><td>tree id</td><td>A fingerprint of a folder's files (from <code>git write-tree</code>). A check or accept counts only while the tree id is unchanged.</td></tr>
+<tr><td>accept</td><td>The lead's recorded verdict that it verified a worker (<code>hco accept --note "…"</code>).</td></tr>
+<tr><td>round</td><td>One pass of work by a worker. A correction sent with <code>hco send</code> starts the next round; the third round is the last.</td></tr>
+<tr><td>gate</td><td>A condition <code>merge</code> enforces: scope respected, check passed on the current files, nothing changed since accept.</td></tr>
 <tr><td>worktree</td><td>A separate checkout of the repo on its own branch. Two workers in two worktrees cannot overwrite each other.</td></tr>
 <tr><td>report</td><td>What a worker leaves when it stops: a <code>RESULT.md</code> file, a <code>STATUS</code> file and, if possible, a one-line message to the lead.</td></tr>
 <tr><td>claim</td><td>Anything a worker says about its own work. The lead treats it as unverified until it checks.</td></tr>
@@ -428,6 +438,7 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
 <tr><td>doc store</td><td>A small versioned database inside herdr-core. Every write raises a document's version number.</td></tr>
 <tr><td>compare-and-set (CAS)</td><td>A write that only succeeds if nobody changed the document since you read it. This is how workers claim jobs without locks.</td></tr>
 <tr><td>orchestrator</td><td>The script <code>hcboard run</code>. It watches the board and keeps enough workers running. It does no jobs itself.</td></tr>
+<tr><td>journal</td><td><code>events.jsonl</code>: one line per <code>hco</code> action. <code>hco log</code> prints it and <code>hco report</code> turns it into a timeline.</td></tr>
 <tr><td>policy file</td><td>House rules you write once. Every brief carries them, and they bind both lead and workers.</td></tr>
 </table>
 
@@ -435,9 +446,13 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
 <table>
 <tr><th>Piece</th><th>Role</th></tr>
 <tr><td><code>SKILL.md</code></td><td>The lead's playbook (the 7 phases below).</td></tr>
-<tr><td><code>scripts/hco.py</code></td><td>Deterministic stdlib-Python helper: run ids, labels, git worktrees, worker brief, status tables, result collection, commit-and-merge, per-run cleanup.</td></tr>
-<tr><td>Worker contract</td><td>Wrapped around every brief: scope rules, no sub-agents, policy, two-channel report.</td></tr>
-<tr><td><code>scripts/hcboard.py</code>, <code>docstore_worker.py</code>, <code>hcdoc.py</code></td><td><b>Board mode</b>: the orchestrator loop (<code>init · run · status · pause · resume</code>), the job-claiming worker, and the guarded doc-store helper they share. Stdlib only.</td></tr>
+<tr><td><code>scripts/hco.py</code></td><td>Deterministic stdlib-Python helper: run ids, labels, git worktrees, worker brief, status tables with a <code>NEXT</code> column, result collection, scope checks, commit-and-merge, per-run cleanup.</td></tr>
+<tr><td>Plan as data</td><td><code>hco plan</code> validates <code>plan.json</code> (names, dependency cycles, parallel writers whose scopes may share a file) and stores it; <code>hco advance</code> starts every worker whose dependencies hold, up to <code>max_parallel</code>.</td></tr>
+<tr><td>Checks and gates</td><td><code>spawn --check</code> names the proving command; <code>hco check</code> runs it in an hc terminal; <code>hco accept</code> records the lead's verdict. <code>merge</code> refuses a worker whose check has not passed on its current files or that changed after accept.</td></tr>
+<tr><td>Rounds</td><td><code>hco send</code> turns a correction into a counted follow-up round and keeps the previous <code>STATUS</code>/<code>RESULT.md</code>.</td></tr>
+<tr><td>Run state</td><td><code>run.json</code> is written under a lock, so parallel <code>spawn</code> calls are safe; a failed spawn rolls its worktree back; every action goes into the journal; <code>hco runs</code> + <code>hco adopt</code> let a restarted lead take over.</td></tr>
+<tr><td>Worker contract</td><td>Wrapped around every brief: scope rules, the check, no sub-agents, policy, two-channel report.</td></tr>
+<tr><td><code>scripts/hcboard.py</code>, <code>docstore_worker.py</code>, <code>hcdoc.py</code></td><td><b>Board mode</b>: the orchestrator loop (<code>init · run · status · pause · resume · cancel</code>), the job-claiming worker, and the guarded doc-store helper they share. Stdlib only.</td></tr>
 <tr><td><code>templates/hco-claude.md</code>, <code>hco-codex.md</code></td><td>hc templates: core waits for the agent to be ready, then pastes the task; tells the lead if it didn't go in.</td></tr>
 <tr><td><code>references/</code></td><td><code>patterns.md</code> (recipes + brief guide), <code>hc-facts.md</code> (verified hc behavior), <code>hc-docstore-notes.md</code> (doc-store facts and board design decisions).</td></tr>
 </table>
@@ -465,7 +480,8 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
 <tr><th></th><th>Lead <span class="pill lead">you-facing</span></th><th>Worker <span class="pill w">hands-on</span></th></tr>
 <tr><td>Does</td><td>Plans, starts workers, steers, verifies, merges, answers to the user.</td><td>Does the actual work in its own hc terminal, inside its scope.</td></tr>
 <tr><td>Must</td><td>Live inside an hc terminal (<code>hco preflight</code> checks).</td><td>Read <code>BRIEF.md</code> first and follow scope, policy and report protocol.</td></tr>
-<tr><td>Must not</td><td>Trust worker reports as fact; approve prompts on the user's behalf.</td><td>Start sub-agents; touch files outside scope; commit.</td></tr>
+<tr><td>Records</td><td>Its verdicts: <code>hco check</code>, <code>hco accept</code>, <code>hco send</code> rounds, all in the run's journal.</td><td><code>RESULT.md</code> + <code>STATUS</code> in its outbox, after its check passes.</td></tr>
+<tr><td>Must not</td><td>Trust worker reports as fact; approve prompts on the user's behalf.</td><td>Start sub-agents; touch files outside scope; weaken a test to pass its check; commit.</td></tr>
 </table>
 
 <h2 id="phases">The 7 phases</h2>
@@ -482,7 +498,7 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
   <li><b><code>blocked</code> means a person must act</b> (question, auth/trust dialog, permission in safe mode). Tell the user exactly what it asks and that <code>hc attach &lt;t&gt;</code> lets them answer. Never <code>hc send --force</code> or press keys to approve for them.</li>
   <li><b>Touch only terminals labeled <code>hco.run=&lt;run&gt;</code></b> (board mode: <code>hco.board=&lt;exp&gt;</code>). Never <code>hc server stop|restart</code>.</li>
   <li><b>Never block yourself.</b> Slow work runs in an hc terminal; use <code>hc wait</code>, not <code>sleep</code>.</li>
-  <li><b>Workers start with permissions bypassed.</b> Only the brief confines them. Use <code>--permissions safe</code> for risky tasks; never drop a safety rule from a brief because bypass would allow it.</li>
+  <li><b>Workers start with permissions bypassed.</b> Only the brief confines them (<code>--scope</code> catches stray repo files afterwards; it prevents nothing). Use <code>--permissions safe</code> for risky tasks; never drop a safety rule from a brief because bypass would allow it. Spawn scrubs secret-looking env vars, but workers can still read any file you can.</li>
   <li><b>Policy files are binding</b> for lead and workers: <code>~/.config/hc-orchestrate/policy.md</code> and <code>&lt;repo&gt;/.hc-orchestrate-policy.md</code>. <code>hco spawn</code> copies them into every brief.</li>
 </ol>
 
@@ -491,18 +507,26 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
 <p>Two channels, because hc only tags agent-to-agent messages when both sides speak OSC 7501, and a sandboxed Codex may be blocked from hc's socket.</p>
 <div class="card-row">
   <div class="card"><h4>1 · Outbox files</h4><p><code>RESULT.md</code> + <code>STATUS</code> in <code>.hc-orchestrate/&lt;run&gt;/out/&lt;worker&gt;/</code>. Always works. Workers write them with their file tool, not shell heredocs.</p></div>
-  <div class="card"><h4>2 · One-line message</h4><p><code>hc send &lt;lead&gt; "[hco &lt;run&gt;/&lt;name&gt;] ..."</code> as a single unchained command. May be refused in Codex's sandbox.</p></div>
+  <div class="card"><h4>2 · One-line message</h4><p><code>hc send &lt;lead&gt; "[hco &lt;run&gt;/&lt;name&gt;] ..."</code> as a single unchained command. Codex's sandbox refuses it in <code>--permissions safe</code>; in the default bypass mode it works.</p></div>
   <div class="card"><h4>+ hc status events</h4><p>Even with neither channel, the lead learns a worker stopped from hc's own status events.</p></div>
 </div>
+<p>A worker reports <code>DONE</code> only once its check (if it has one) exits 0. If it needs a file outside its scope it stops with <code>STATUS</code> <code>BLOCKED: needs &lt;path&gt; (outside my scope)</code> instead of editing it. After a follow-up round (<code>hco send</code>), the previous report is kept as <code>STATUS.r1</code> / <code>RESULT.r1.md</code> and the new instructions are in <code>FOLLOWUP.r2.md</code>, so the table never shows a stale <code>DONE</code>.</p>
 <div class="callout warn"><b class="t">Trap</b>If a worker chains <code>cat &gt; file &amp;&amp; hc send ...</code> in one shell call, it misses the <code>Bash(hc send *)</code> allow rule and blocks on a permission prompt (found in live testing, fixed in the brief).</div>
 
 <h2 id="signals">Supervision signals (phase 3)</h2>
 <div class="callout plain"><b class="t">In plain words</b>While workers work, the lead mostly waits. Each kind of news below means something different, and this table is the lead's guide to what to do about it.</div>
+<p><code>hco wait</code> and <code>hco status</code> apply this table for the lead: their <code>NEXT</code> column names the next step per worker (<code>wait</code>, <code>run check</code>, <code>check failed: send follow-up</code>, <code>verify, then accept</code>, <code>merge</code>, <code>person must answer (hc attach)</code>, <code>no report yet: trust dialog?</code>, <code>over its 30 min budget: hc read</code>, …). It is a hint computed from hc's state and the STATUS file, not a verdict.</p>
+<pre><code>WORKER  ADDRESS  AGENT   ROLE       STATE  STATUS              TURN  EXIT  OUTBOX  NEXT
+api     t8       claude  implement  live   done                3     -     DONE    run check
+ui      t9       claude  implement  live   blocked/permission  1     -     -       person must answer (hc attach)
+rev     t10      codex   review     live   working             2     -     -       wait</code></pre>
+<p class="hint">Example values. <code>STATUS</code> is hc's status event, <code>OUTBOX</code> the first line of the worker's STATUS file. <code>--json</code> adds <code>round</code> and <code>age_min</code>.</p>
 <table>
 <tr><th>Signal</th><th>What the lead does</th></tr>
 <tr><td><code>message</code></td><td>Match the <code>[hco run/name]</code> prefix, then read that worker's RESULT.md — the message alone proves nothing.</td></tr>
 <tr><td>idle/done, STATUS <code>DONE</code></td><td>Go to Verify.</td></tr>
 <tr><td>stopped, no STATUS</td><td><code>hc read &lt;t&gt; --lines 80</code>, then send "You stopped without reporting. Finish or report per your BRIEF.md."</td></tr>
+<tr><td>reported, then needs a correction</td><td><code>hco send --name &lt;n&gt; --text "&lt;the concrete error&gt;"</code>: a counted round, not a bare <code>hc send</code>.</td></tr>
 <tr><td><code>blocked</code></td><td>Rule 3: tell the user, they <code>hc attach</code>.</td></tr>
 <tr><td><code>error</code></td><td>Read why; send a fix, or <code>hc kill</code> and respawn with a sharper brief.</td></tr>
 <tr><td>exited</td><td>Read last lines; respawn once if worth it, else report the failure.</td></tr>
@@ -516,7 +540,7 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
 <table>
 <tr><th>Pattern</th><th>Use when</th><th>Shape</th></tr>
 <tr><td>1. Fan-out / fan-in</td><td>Independent parts, no shared files</td><td>N writers in worktrees → wait → collect → merge in a buildable order. Define shared types first, then <code>--base &lt;ref&gt;</code>.</td></tr>
-<tr><td>2. Build → review</td><td>Anything that matters</td><td>One vendor builds; the other reviews read-only in the builder's worktree (<code>--cwd</code>). Send builder only findings you agree with. Max 2 rounds.</td></tr>
+<tr><td>2. Build → review</td><td>Anything that matters</td><td>One vendor builds; the other reviews read-only in the builder's worktree (<code>--cwd</code>, or <code>"cwd": "@build"</code> with <code>"after": ["build:done"]</code> in a plan). Send the builder only findings you agree with, as <code>hco send --file findings.md</code>. At most 2 follow-up rounds.</td></tr>
 <tr><td>3. Variants / tournament</td><td>Right approach unclear</td><td>Same task and check, one thing differs. Judge on evidence you produce, keep losers' branches.</td></tr>
 <tr><td>4. Pipeline</td><td>Stages feed each other</td><td>research → design → implement → test; verify each stage before the next.</td></tr>
 <tr><td>5. Watcher</td><td>Servers, builds, CI</td><td><code>hc run --bg --label hco.run=&lt;run&gt;</code>; <code>hc wait --output "ready"</code>. Plain programs report no status.</td></tr>
@@ -526,12 +550,73 @@ $hc-orchestrate &lt;task&gt;     # Codex</code></pre>
 </table>
 
 <h3>Fan-out example</h3>
-<pre><code>hco spawn --run k3x9 --name api  --agent claude --role implement --worktree --brief api.md
-hco spawn --run k3x9 --name ui   --agent claude --role implement --worktree --brief ui.md
-hco spawn --run k3x9 --name docs --agent codex  --role implement --worktree --brief docs.md
-hco wait    --run k3x9 --timeout 100    # repeat until all STATUS are DONE
-hco collect --run k3x9</code></pre>
+<pre><code>hco spawn --run k3x9 --name api  --agent claude --worktree --scope 'src/api/**' 'tests/api/**' --check 'pytest tests/api -q' --brief api.md
+hco spawn --run k3x9 --name ui   --agent claude --worktree --scope 'src/ui/**' --check 'npm test -- ui' --brief ui.md
+hco spawn --run k3x9 --name docs --agent codex  --worktree --scope 'docs/**' --check 'make docs' --brief docs.md
+hco wait    --run k3x9 --timeout 100    # repeat until NEXT says "run check" for each
+hco collect --run k3x9                  # results + scope ok / !! out of scope
+hco check   --run k3x9 --name api       # likewise ui, docs
+hco accept  --run k3x9 --name api --note "read the diff, check passed"
+hco merge   --run k3x9 --dry-run        # then without --dry-run</code></pre>
+<p class="hint">Several <code>spawn</code> calls at once are safe: <code>run.json</code> is written under a lock. With three or more workers, or any that wait for another, write a <a href="#plans">plan</a> instead and let <code>hco advance</code> start them.</p>
 
+<h2 id="plans">Plans, checks &amp; rounds</h2>
+<div class="callout plain"><b class="t">In plain words</b>Before, “who waits for whom” and “this one is verified” lived only in the lead's head. Now they are written down and <code>hco</code> enforces them: a worker starts only when what it depends on is finished, and a piece of work cannot be merged until its test has passed on exactly the files being merged and the lead has signed it off.</div>
+
+<h3>The plan as data</h3>
+<p>With three or more workers, or any worker that waits for another, the lead also writes the plan table as <code>plan.json</code>. Each worker takes <code>hco spawn</code>'s options plus <code>after</code>:</p>
+<pre><code>{"max_parallel": 4, "workers": [
+  {"name": "build", "agent": "claude", "brief": "build.md", "worktree": true,
+   "scope": ["src/api/**"], "check": "pytest tests/api -q", "deadline_min": 30},
+  {"name": "rev", "agent": "codex", "role": "review", "brief": "rev.md",
+   "cwd": "@build", "after": ["build:done"]},
+  {"name": "docs", "agent": "claude", "brief": "docs.md", "worktree": true,
+   "scope": ["docs/**"], "check": "make docs", "after": ["build:merged"]}]}</code></pre>
+<table>
+<tr><th><code>after</code> entry</th><th>Holds when</th></tr>
+<tr><td><code>"build:done"</code></td><td>build reported <code>DONE</code> and, if it has a check, the check passed on its current files.</td></tr>
+<tr><td><code>"build"</code></td><td>The lead ran <code>hco accept</code> for build.</td></tr>
+<tr><td><code>"build:merged"</code></td><td>build was merged, so a worktree started now contains its code.</td></tr>
+</table>
+<p><code>hco plan --run R --file plan.json</code> reports every problem at once and stores nothing on error: unknown keys, bad names, missing briefs, unknown or cyclic dependencies, <code>:merged</code> on a worker without a worktree, a scope on a read-only role, and <b>two writers that can run at the same time whose scopes may share a file</b> (<code>--allow-overlap</code> stores it anyway). The overlap test errs towards refusing: <code>src/a*</code> and <code>src/b*</code> count as overlapping. <code>hco advance</code> then starts every worker whose <code>after</code> holds, up to <code>max_parallel</code>, adds the earlier workers' <code>RESULT.md</code> paths to its brief, and prints JSON with <code>started</code>, <code>waiting</code> (with the reason per worker) and <code>complete</code>. Run it again after each <code>accept</code> or <code>merge</code>.</p>
+
+<h3>Four gates before a merge</h3>
+<p>A worker in a stored plan moves through these states. Every arrow is a command the lead runs, and <code>NEXT</code> in the status table names the next one.</p>
+<div class="stage" id="gate-stage">
+  <div class="stage-head"><span class="live"><i></i>live</span><span class="stage-title grow">worker build, run k3x9</span>
+    <div class="ctl"><button data-act="toggle">❚❚</button></div></div>
+  <svg id="gate-svg" viewBox="0 0 900 310" role="img" aria-label="Worker gates: planned, working, reported, checked, accepted, merged, with follow-up rounds and changed files sending it back"></svg>
+  <div class="caption" id="gate-cap"></div>
+</div>
+<table>
+<tr><th>Gate</th><th>Command</th><th>What it records or refuses</th></tr>
+<tr><td>Scope</td><td><code>spawn --scope 'src/api/**'</code></td><td><code>collect</code> flags any other changed file (renames and deletions included); <code>merge</code> refuses before committing anything. <code>hco scope --add</code> widens one worker's scope; <code>--ignore-scope</code> overrides and says so.</td></tr>
+<tr><td>Check</td><td><code>spawn --check '&lt;cmd&gt;'</code>, then <code>hco check</code></td><td>Runs the command with <code>sh -c</code> in the worker's folder, in an hc terminal, output in <code>checks/&lt;worker&gt;.log</code>. Exit 0 passed, 1 failed (log tail shown), 124 still running after <code>--timeout</code> (the same command picks it up again). If a file changed while it ran, the result does not count.</td></tr>
+<tr><td>Accept</td><td><code>hco accept --note "&lt;how&gt;"</code></td><td>The lead's verdict. Refuses a STATUS other than <code>DONE</code>, a check that has not passed on the current files, out-of-scope files, and a reviewer that changed files. <code>--force</code> records the override and its reasons.</td></tr>
+<tr><td>Unchanged</td><td><code>hco merge</code></td><td>Refuses (exit 1, nothing committed) a worker whose check is missing, failed or older than its files, or whose files changed after accept: <code>NOT VERIFIED</code>. <code>--dry-run</code> marks them; <code>--skip-checks</code> overrides and says so. A worker with neither a check nor an accept merges as before.</td></tr>
+</table>
+<div class="callout"><b class="t">Why a tree id, not a timestamp</b>A check and an accept each store <code>git write-tree</code> of the folder's tracked and untracked files (ignored files and outboxes left out), built in a throwaway index. Any edit changes it; committing the same content does not. That is why <code>merge</code>, which commits the worktree, can be rerun after a conflict without a new check. Checks that write files git does not ignore need those files excluded, or they invalidate their own result.</div>
+
+<h3>Follow-up rounds</h3>
+<pre><code>hco send --run k3x9 --name build --text "test_burst fails: &lt;error&gt;"      # round 2
+hco send --run k3x9 --name build --file findings.md                      # e.g. review findings you agree with</code></pre>
+<p>The text goes to <code>FOLLOWUP.r2.md</code> in the outbox, the old <code>STATUS</code>/<code>RESULT.md</code> move to <code>STATUS.r1</code>/<code>RESULT.r1.md</code> (so the table cannot show round 1's <code>DONE</code>), an earlier accept is dropped, and a one-line <code>hc send</code> points the worker at the file. If that send fails, the files are put back. After 3 rounds (the task plus two follow-ups) <code>hco send</code> exits 4 and the lead reports to you. <code>spawn --deadline 30</code> flags a round that runs past 30 minutes in <code>NEXT</code>; nothing is killed.</p>
+
+<h3>The journal and the report</h3>
+<p>Every action (<code>init</code>, <code>spawn</code>, <code>spawn_failed</code>, <code>plan</code>, <code>advance</code>, <code>check</code>, <code>accept</code>, <code>followup</code>, <code>scope_add</code>, <code>merge</code>, <code>merge_refused</code>, <code>merge_conflict</code>, <code>adopt</code>, <code>cleanup</code>, …) adds a line to <code>events.jsonl</code>. <code>hco log</code> prints it; <code>hco report</code> writes <code>REPORT.md</code>: a table per worker (rounds, STATUS, check, accept, merge commit) and the timeline. It lists what <code>hco</code> recorded, so the lead adds what it verified by other means.</p>
+
+<h2 id="restart">A restarted lead</h2>
+<div class="callout plain"><b class="t">In plain words</b>If the lead's terminal closes or its memory resets, the run is not lost. The run's files say who was working on what, and a new lead can take over.</div>
+<pre><code>hco runs                       # the runs in this repo (reads files only, no hc needed)
+hco status --run k3x9          # what survived
+hco adopt  --run k3x9          # become the lead of k3x9
+hco advance --run k3x9         # with a plan: carry on where it stopped</code></pre>
+<ul>
+  <li><b>Workers end with their lead</b> unless spawned with <code>--outlive</code>. Use it for long runs.</li>
+  <li><b><code>adopt</code></b> records the new lead address, rewrites it in the surviving workers' briefs and sends each live local worker one message with it (<code>--quiet</code>: briefs only).</li>
+  <li><b>Waiting changes.</b> hc reports child news only to the terminal that started a worker, so for adopted workers <code>hco wait</code> compares hc state and STATUS files every few seconds instead (<code>--interval</code>, default 3 s). It prints the same table and remembers what it last showed, so a report that arrived between two waits still counts as news.</li>
+  <li>A worker on another machine cannot be told the new address (that machine has its own name for this one); <code>adopt</code> prints the <code>hc send</code> to adapt. Its STATUS file still reaches the lead.</li>
+</ul>
 
 <h2 id="board">Board mode: batch jobs that survive crashes</h2>
 <div class="callout plain"><b class="t">In plain words</b>Picture twelve identical chores: run the same script on twelve different inputs. You don't need clever agents, you need reliability. Board mode writes each chore on a shared noticeboard. Workers take chores from the board, and a watcher makes sure someone is always working, even after a crash.</div>
@@ -558,7 +643,7 @@ hco collect --run k3x9</code></pre>
 <tr><td>State lives in</td><td>Outbox files, <code>run.json</code>, the lead's context</td><td>Docs in the core: <code>sk-&lt;exp&gt;</code> + one doc per job</td></tr>
 <tr><td>Who watches</td><td>The lead, via <code>hco wait</code></td><td><code>hcboard run</code>, a script reacting to events; the lead just waits on its terminal</td></tr>
 <tr><td>Crash of a worker</td><td>Lead notices, respawns</td><td>Orchestrator requeues the job (<code>attempt</code> counted)</td></tr>
-<tr><td>Crash of the lead / orchestrator</td><td>Workers end with the lead unless <code>--outlive</code></td><td>Workers keep going; rerun <code>hcboard run</code> and it reconciles from the docs</td></tr>
+<tr><td>Crash of the lead / orchestrator</td><td>Workers end with the lead unless <code>--outlive</code>; a new lead takes over with <code>hco adopt</code></td><td>Workers keep going; rerun <code>hcboard run</code> and it reconciles from the docs</td></tr>
 <tr><td>Use when</td><td>Parts need thinking, review, merging</td><td>Many identical-shape jobs, results to compare</td></tr>
 </table>
 
@@ -611,6 +696,7 @@ hco collect --run k3x9</code></pre>
   "jobs": ["sk-e051-j001", "…"],
   "job_cmd": ["./job.sh","{case}","{variant}","{out}"],
   "max_workers": 3,
+  "retry_delay_s": 30,
   "state": "running"
 }</code></pre>
 <pre><code>// job  sk-e051-j007   (one worker at a time)
@@ -626,7 +712,7 @@ hco collect --run k3x9</code></pre>
              "error": null}
 }</code></pre>
 </div>
-<p><code>job_cmd</code> placeholders: <code>{case} {variant} {out} {job} {exp} {attempt}</code>. Manifest <code>state</code> is <code>planned → running ⇄ paused → done → archived</code>. Large output goes to files (<code>runs/&lt;exp&gt;/&lt;job&gt;.json</code> and <code>.log</code>); docs keep only paths and a short summary.</p>
+<p><code>job_cmd</code> placeholders: <code>{case} {variant} {out} {job} {exp} {attempt}</code>. Manifest <code>state</code> is <code>planned → running ⇄ paused → done → archived</code>, or <code>→ cancelled → done → archived</code> after <code>hcboard cancel</code>. Instead of the full grid a spec can list <code>pairs</code> (<code>[[case, variant], ...]</code>) for a grid with holes. With <code>retry_delay_s</code> a failed job is not retried at once: it waits the delay, doubled per attempt (at most 10 minutes), stored on the job as <code>not_before_ms</code>, and the worker stays alive meanwhile. Large output goes to files (<code>runs/&lt;exp&gt;/&lt;job&gt;.json</code> and <code>.log</code>); docs keep only paths and a short summary.</p>
 <table>
 <tr><th>Rule</th><th>Why</th></tr>
 <tr><td>Names <code>^[a-z0-9_-]{1,32}$</code> and start with <code>sk-</code>; jobs are <code>sk-&lt;exp&gt;-jNNN</code></td><td>Core's own rule is looser (it also allows <code>.</code>); the helper is stricter on purpose. Max 999 jobs per experiment.</td></tr>
@@ -659,7 +745,7 @@ hco collect --run k3x9</code></pre>
 <tr><th>Who</th><th>May write</th><th>Guard</th></tr>
 <tr><td>Worker</td><td>claim; result (<code>done</code>); failure (<code>pending</code> or <code>failed</code>)</td><td>Result writes require <code>state == running</code> and <code>owner == me</code> and <code>attempt == mine</code>: a worker the orchestrator already gave up on (a "zombie") cannot overwrite a newer attempt.</td></tr>
 <tr><td>Orchestrator</td><td>requeue of orphans; fail an exhausted <code>pending</code> job; manifest <code>planned→running</code>, <code>→done</code>, <code>→archived</code>; deletes at the end</td><td>Requeue requires the same <code>state/owner/attempt</code> it observed, so it can't clobber a job that just finished.</td></tr>
-<tr><td>You</td><td>manifest <code>running ⇄ paused</code> (<code>hcboard pause|resume</code>), or by hand</td><td>CAS like everyone else.</td></tr>
+<tr><td>You</td><td>manifest <code>running ⇄ paused</code> (<code>hcboard pause|resume</code>), <code>→ cancelled</code> (<code>hcboard cancel</code>), or by hand</td><td>CAS like everyone else.</td></tr>
 </table>
 <div class="callout warn"><b class="t">Delivery is at-least-once</b>A worker killed after <code>job_cmd</code> finished but before the result write means the job runs again. Make <code>job_cmd</code> safe to run twice. (The worker deletes a stale output file before each attempt, so attempt 1's file never passes for attempt 2's result.)</div>
 
@@ -676,11 +762,14 @@ hco collect --run k3x9</code></pre>
 </table>
 <ol>
   <li>List <code>hc ls --all --label hco.board=&lt;exp&gt;</code> <em>before</em> reading jobs, so a worker started later is never judged by an older list.</li>
-  <li>Read the manifest and every job doc. A <code>running</code> job whose owner is not a live worker is an <b>orphan</b>: requeue it (<code>pending</code>, or <code>failed</code> if <code>attempt ≥ max_attempts</code>). A <code>pending</code> job already out of attempts becomes <code>failed</code>.</li>
+  <li>Read the manifest and the job docs (between two timer ticks only the ones that had an event; see below). A <code>running</code> job whose owner is not a live worker is an <b>orphan</b>: requeue it (<code>pending</code>, or <code>failed</code> if <code>attempt ≥ max_attempts</code>). A <code>pending</code> job already out of attempts becomes <code>failed</code>.</li>
+  <li>If the manifest is <code>cancelled</code>: kill this experiment's live workers (each kills its job's process group), fail every unfinished job with error <code>cancelled</code>, then finish.</li>
   <li>If the manifest is <code>running</code>, start <code>min(max_workers, pending + running) − live</code> workers (<code>hc run --bg --outlive-parent --no-notify</code>, labels <code>exp</code>, <code>role=worker</code>, <code>hco.board</code>). <code>paused</code> starts none.</li>
   <li>If nothing is <code>pending</code> or <code>running</code>: <b>finish</b>.</li>
 </ol>
-<p><b>Finish order</b> (each step is safe to redo): manifest <code>done</code> → export <code>experiments/&lt;exp&gt;.json</code> and check it holds every job → <code>git commit</code> that one file → manifest <code>archived</code> → delete job docs, then the manifest → <code>hc rm</code> its finished worker terminals → print the table and <code>HCBOARD &lt;exp&gt; COMPLETE done=N failed=M</code>. A failed commit stops <em>before</em> any deletion.</p>
+<p><b>Before the first job</b>, <code>run</code> checks what would otherwise fail only at the end: that <code>--cwd</code> is a git repo, <code>experiments/&lt;exp&gt;.json</code> is not ignored, a git identity is set, and <code>job_cmd</code> can start. If not, it exits 2 with the reason and no job runs.</p>
+<p><b>Finish order</b> (each step is safe to redo): manifest <code>done</code> → export <code>experiments/&lt;exp&gt;.json</code> and check it holds every job → <code>git commit</code> that one file → manifest <code>archived</code> → delete job docs, then the manifest → <code>hc rm</code> its finished worker terminals → print the table and <code>HCBOARD &lt;exp&gt; COMPLETE done=N failed=M</code> (with <code>CANCELLED</code> appended after a cancel). A failed commit stops <em>before</em> any deletion. If jobs failed, the output also prints the <code>--retry-failed</code> command for them.</p>
+<p><b>Fewer reads.</b> A worker skips jobs it already saw finished, and between two <code>--poll</code> ticks the orchestrator re-reads only job docs that had an event. The timer, a <code>missed</code> notice and a confirming read before finishing re-read all of them. With 30 jobs and one worker, reads dropped from 806 to 372, now growing linearly with the job count (measured against the fake core).</p>
 <div class="callout tip"><b class="t">Safety nets</b>Ten worker crashes with no job finishing in between abort the run (no restart storm). The worker kills its job's process group on SIGHUP/SIGTERM. A child experiment appearing while the parent runs is reported as an event, never started automatically.</div>
 
 <h3>Walk through a run</h3>
@@ -691,13 +780,16 @@ hco collect --run k3x9</code></pre>
 <h3>Commands</h3>
 <table>
 <tr><th>Command</th><th>Purpose</th></tr>
-<tr><td><code>hcboard.py init EXP --spec spec.json [--parent P --delta JSON]</code></td><td>Write job docs, then the manifest (<code>planned</code>). Exit 4 = this hc has no doc methods: use the normal flow. Spec keys: <code>question cases variants job_cmd max_workers max_attempts pre out_dir job_timeout_s</code>.</td></tr>
-<tr><td><code>hcboard.py run EXP [--cwd D] [--poll S] [--timeout S] [--no-commit]</code></td><td>The orchestrator. Start it as <code>hc run --bg --name EXP-orch --outlive-parent --cwd "$PWD" -- python3 …/hcboard.py run EXP</code>. Prints one JSON event per line.</td></tr>
-<tr><td><code>hcboard.py status EXP [--json]</code> · <code>pause EXP</code> · <code>resume EXP</code></td><td>Counts and job table; flip the manifest between <code>running</code> and <code>paused</code>. Workers finish their current job, then exit.</td></tr>
+<tr><td><code>hcboard.py init EXP --spec spec.json [--parent P --delta JSON]</code></td><td>Write job docs, then the manifest (<code>planned</code>). Exit 4 = this hc has no doc methods: use the normal flow. Spec keys: <code>question cases variants job_cmd max_workers max_attempts</code>, optional <code>pre out_dir job_timeout_s retry_delay_s pairs</code>.</td></tr>
+<tr><td><code>hcboard.py init NEW --retry-failed OLD [--spec S]</code></td><td>A child experiment of only OLD's failed jobs, read from <code>experiments/OLD.json</code>. Without <code>--spec</code> it reuses OLD's settings; with it you can change <code>job_cmd</code> or limits. Never rerun a whole grid for a few failures.</td></tr>
+<tr><td><code>hcboard.py run EXP [--cwd D] [--poll S] [--timeout S] [--no-commit]</code></td><td>The orchestrator. Start it as <code>hc run --bg --name EXP-orch --outlive-parent --cwd "$PWD" -- python3 …/hcboard.py run EXP</code>. Checks first, then prints one JSON event per line.</td></tr>
+<tr><td><code>hcboard.py status EXP [--json]</code></td><td>Counts, job table, time so far, mean time per finished job, a rough time left (unfinished jobs × mean ÷ workers), retried attempts, done/failed/open per variant (<code>stats</code> and <code>variants</code> in <code>--json</code>).</td></tr>
+<tr><td><code>hcboard.py pause EXP</code> · <code>resume EXP</code></td><td>Flip the manifest between <code>running</code> and <code>paused</code>. Workers finish their current job, then exit.</td></tr>
+<tr><td><code>hcboard.py cancel EXP</code></td><td>Stop for good: the orchestrator kills the workers and their jobs, fails unfinished jobs as <code>cancelled</code>, exports and archives; the last line ends <code>CANCELLED</code>. The lead asks you first.</td></tr>
 <tr><td><code>hcdoc.py get | set | update | claim | delete | watch | export</code></td><td>The guarded helper under it all. <code>update</code> takes <code>--if P=JSON</code>, <code>--set P=JSON</code>, <code>--set-str</code>, <code>--incr P</code>, <code>--now P</code> (no expression eval). Transport: <code>hc connect</code>, falling back to the core's Unix socket.</td></tr>
 <tr><td><code>docstore_worker.py EXP</code></td><td>Started by the orchestrator, one per slot. Claims, runs, writes, repeats; exits 0 when nothing is claimable.</td></tr>
 </table>
-<p><b>Exit codes</b> — <code>hcdoc</code>: 0 ok, 2 bad input, 3 conflict lost / claim lost / precondition false, 4 core unavailable or doc methods missing. <code>hcboard</code>: 0 finished, 1 failed or gave up, 2 bad input, 4 core down.</p>
+<p><b>Exit codes</b> — <code>hcdoc</code>: 0 ok, 2 bad input, 3 conflict lost / claim lost / precondition false, 4 core unavailable or doc methods missing. <code>hcboard</code>: 0 finished, 1 failed or gave up, 2 bad input or a failed start-up check, 4 core down.</p>
 
 <h3>Verified against hc 0.1.17</h3>
 <p>Every design assumption was checked live in an isolated session before any code was written (<code>references/hc-docstore-notes.md</code>).</p>
@@ -717,7 +809,7 @@ hco collect --run k3x9</code></pre>
 </table>
 
 <h3>Tests</h3>
-<p><b>84 tests</b>, all passing: the original 21 for <code>hco</code>, plus 63 for the board. The live ones run in their own <code>HC_SESSION</code> with scratch XDG dirs and <code>tests/fake_job.sh</code> as the job (no LLM, no mainframe), and stop only that core afterwards.</p>
+<p><b>194 tests</b> in the repo, run in CI on Python 3.11, 3.12 and 3.13; the 17 live ones skip without <code>hc</code>. The live board tests run in their own <code>HC_SESSION</code> with scratch XDG dirs and <code>tests/fake_job.sh</code> as the job (no LLM, no mainframe), and stop only that core afterwards. <code>tests/fake_core.py</code> is a file-backed stand-in core (doc store with compare-and-set and events, plus <code>ls/get/run/kill/rm</code> that really start and signal processes), so the orchestrator and workers also run end to end in CI. <code>cancel</code>, <code>--retry-failed</code>, <code>retry_delay_s</code>, <code>pairs</code>, the start-up checks and the read savings were tested against the fake core only, not a real one.</p>
 <table>
 <tr><th>Live scenario</th><th>Proves</th></tr>
 <tr><td>Name / size validation</td><td>Bad names, <code>herdr-app</code>, &gt; 1 MB values and non-<code>schema:1</code> values are refused and nothing is written</td></tr>
@@ -736,7 +828,8 @@ hco collect --run k3x9</code></pre>
   <li>One orchestrator per experiment: two would race on requeues.</li>
   <li>Remote owners (<code>machine/t7</code>) are never requeued.</li>
   <li>Workers do not emit OSC 7501 status: <code>hc --skill</code> does not give the report format and it was not guessed. They print progress lines instead (<code>hc read &lt;worker&gt;</code>).</li>
-  <li>Every reconcile re-reads all job docs (~7 ms each): fine for hundreds of jobs.</li>
+  <li>Between two <code>--poll</code> timers the orchestrator re-reads only job docs that had an event; the timer re-reads all of them (~7 ms each): fine for hundreds of jobs.</li>
+  <li>Not confirmed live: that <code>hc kill</code> on a worker reaches its SIGHUP handler as the notes describe (<code>cancel</code> relies on it to stop the job's process group), and event timing under load.</li>
   <li><code>zowe</code> anywhere in <code>job_cmd</code> is refused (policy: no agent-issued mainframe commands). That is a tripwire, not a sandbox; the policy files still apply.</li>
 </ul>
 
@@ -765,24 +858,34 @@ Refactors outside auth; dependency upgrades.</code></pre>
 <div class="callout plain"><b class="t">In plain words</b>By default workers start with their guard rails off so they never stall on prompts. The brief is the only fence around them. For risky tasks, switch to <em>safe</em> mode and let the prompts back in.</div>
 <table>
 <tr><th>Mode</th><th>Claude</th><th>Codex</th><th>Notes</th></tr>
-<tr><td><b>bypass</b> (default)</td><td><code>--dangerously-skip-permissions</code></td><td><code>--dangerously-bypass-approvals-and-sandbox</code></td><td>Scope, "no sub-agents", policy are instructions only — not enforced.</td></tr>
+<tr><td><b>bypass</b> (default)</td><td><code>--dangerously-skip-permissions</code></td><td><code>--dangerously-bypass-approvals-and-sandbox</code></td><td>Scope, "no sub-agents", policy are instructions only — not enforced while the worker runs. <code>--scope</code> detects stray repo files afterwards, at <code>collect</code> and <code>merge</code>; it can't see files outside the repo or anything git ignores.</td></tr>
 <tr><td><b>safe</b></td><td><code>--permission-mode acceptEdits</code> + allow <code>hc send</code></td><td><code>--sandbox workspace-write --ask-for-approval on-request</code></td><td>Direct command, no template. A prompt makes the worker <code>blocked</code>.</td></tr>
 </table>
 <ul>
   <li><b>Env scrub (default on):</b> before the agent starts, secret-looking vars are unset — names containing TOKEN, SECRET, PASSW, CREDENTIAL, API_KEY, PRIVATE, ACCESS_KEY, COOKIE, AUTH, and prefixes MAINFRAME_, RALLY_, JENKINS_, ZOWE_, AWS_, AZURE_, GCP_, GH_, GITHUB_, NPM_. Kept: ANTHROPIC_*, OPENAI_*, CODEX_*, CLAUDE*, HC_*. Opt out with <code>--no-scrub</code>.</li>
+  <li><b>Codex reasoning effort</b> is pinned to <code>high</code> (templates and <code>hco.py</code>), so workers don't inherit an <code>xhigh</code> from <code>~/.codex/config.toml</code>. The model still comes from your Codex config.</li>
+  <li><b>Folder trust:</b> <code>hco spawn --trust</code> pre-accepts the agent's folder-trust prompt for the worker's folder (it edits <code>~/.claude.json</code> or <code>~/.codex/config.toml</code>). Opt-in and local only: a trusted folder's project hooks, MCP servers and settings are honored, so use it only for folders you would trust anyway.</li>
   <li><b>Not covered:</b> files on disk. A bypassed worker can read <code>~/.ssh</code> or <code>~/.broadcom-creds</code> like you can.</li>
   <li><b>Board mode:</b> workers are plain scripts, so there are no permission modes. Guards instead: only <code>sk-</code> docs, never <code>herdr-app</code>; <code>zowe</code> refused in <code>job_cmd</code>; secrets never in docs; the orchestrator touches only terminals labeled <code>hco.board=&lt;exp&gt;</code> and never uses <code>hc send --force</code>. <code>job_cmd</code> itself runs with your account's rights.</li>
   <li><b>Policy files</b> are appended to every brief and override the task, but remain advisory against a bypassed or compromised worker.</li>
 </ul>
 
 <h2 id="files">Files a run creates</h2>
-<pre><code>&lt;repo&gt;/.hc-orchestrate/&lt;run&gt;/          (git-ignored via .git/info/exclude)
-  run.json                             run + worker records
+<pre><code>&lt;repo&gt;/.git/info/exclude              + /.hc-orchestrate/ and check artifacts
+                                       (__pycache__/, *.pyc, .pytest_cache/, node_modules/, .DS_Store, …)
+&lt;repo&gt;/.hc-orchestrate/&lt;run&gt;/          (git-ignored via .git/info/exclude)
+  run.json                             run + worker records (written under .lock)
+  events.jsonl                         journal: one line per hco action (hco log)
   PLAN.md                              the lead's plan
+  plan/&lt;worker&gt;.md                     brief copies of a stored plan (hco plan)
+  checks/&lt;worker&gt;.log                  output of the worker's last check
+  REPORT.md                            written by hco report
   wt/&lt;worker&gt;/                         git worktree, branch hco/&lt;run&gt;/&lt;worker&gt;
   workers/&lt;worker&gt;/BRIEF.md            brief copy; outboxes archived here on cleanup
 &lt;worker cwd&gt;/.hc-orchestrate/&lt;run&gt;/out/&lt;worker&gt;/
-  BRIEF.md  RESULT.md  STATUS          the worker's outbox</code></pre>
+  BRIEF.md  RESULT.md  STATUS          the worker's outbox (on another machine with --on:
+                                       git-excluded there too, deleted by cleanup)
+  FOLLOWUP.r2.md  STATUS.r1  RESULT.r1.md   after a follow-up round (hco send)</code></pre>
 <p>Board mode, in the repo you pass as <code>--cwd</code>:</p>
 <pre><code>runs/&lt;exp&gt;/&lt;job&gt;.json            the job's output file ({out})
 runs/&lt;exp&gt;/&lt;job&gt;.log             its stdout + stderr (last 300 chars go into result.error on failure)
@@ -794,20 +897,29 @@ experiments/&lt;exp&gt;.json            manifest + every job doc, exported and g
 <table>
 <tr><th>Command</th><th>Purpose</th></tr>
 <tr><td><code>hco preflight</code></td><td>Check hc, lead terminal, agents, templates.</td></tr>
-<tr><td><code>hco init --task "..."</code></td><td>Create a run; prints run id.</td></tr>
-<tr><td><code>hco spawn --run R --name N --agent claude|codex --brief F</code></td><td>Start a worker. Flags: <code>--role</code>, <code>--worktree</code>, <code>--base</code>, <code>--cwd</code>, <code>--on</code>, <code>--permissions bypass|safe</code>, <code>--no-scrub</code>, <code>--model</code>, <code>--direct</code>, <code>--outlive</code>.</td></tr>
-<tr><td><code>hco wait --run R --timeout 100</code></td><td>Block until news; prints status table.</td></tr>
+<tr><td><code>hco init --task "..."</code></td><td>Create a run; prints run id. Adds check artifacts to <code>.git/info/exclude</code>.</td></tr>
+<tr><td><code>hco runs [--json]</code></td><td>List the runs in this repo (files only).</td></tr>
+<tr><td><code>hco plan --run R --file plan.json [--allow-overlap]</code></td><td>Validate and store the plan; without <code>--file</code>, print it.</td></tr>
+<tr><td><code>hco advance --run R [--dry-run]</code></td><td>Start every planned worker whose <code>after</code> holds, up to <code>max_parallel</code>; JSON with <code>started</code>, <code>waiting</code>, <code>complete</code>.</td></tr>
+<tr><td><code>hco spawn --run R --name N --agent claude|codex --brief F</code></td><td>Start a worker. Flags: <code>--role</code>, <code>--worktree</code>, <code>--base</code>, <code>--cwd</code>, <code>--scope P…</code>, <code>--check CMD</code>, <code>--deadline MIN</code>, <code>--max-rounds N</code>, <code>--on</code>, <code>--permissions bypass|safe</code>, <code>--no-scrub</code>, <code>--trust</code>, <code>--model</code>, <code>--direct</code>, <code>--outlive</code>.</td></tr>
+<tr><td><code>hco wait --run R --timeout 100 [--poll]</code></td><td>Block until news; prints the status table with <code>NEXT</code>. Polls for adopted workers.</td></tr>
 <tr><td><code>hco status --run R [--json]</code></td><td>Current state of all workers.</td></tr>
-<tr><td><code>hco collect --run R</code></td><td>Gather RESULTS; flags out-of-scope edits and reviewers that changed files.</td></tr>
-<tr><td><code>hco merge --run R [--name N]...</code></td><td>Commit each worktree as <code>hco R/N</code>, then <code>git merge --no-ff</code>. Refuses a dirty root; aborts cleanly on conflict.</td></tr>
-<tr><td><code>hco cleanup --run R [--worktrees]</code></td><td>Kill + rm run terminals, archive outboxes; optionally remove clean merged worktrees. Branches kept.</td></tr>
+<tr><td><code>hco collect --run R</code></td><td>Gather results; <code>scope ok</code> or <code>!! changed files outside its scope</code>; flags reviewers that changed files.</td></tr>
+<tr><td><code>hco scope --run R --name N [--add P…]</code></td><td>Show or widen one worker's scope; prints the <code>hc send</code> go-ahead.</td></tr>
+<tr><td><code>hco check --run R --name N [--cmd C]</code></td><td>Run the worker's check in an hc terminal; exit 0 / 1 / 124 (still running).</td></tr>
+<tr><td><code>hco accept --run R --name N --note "…" [--force]</code></td><td>Record the lead's verdict, tied to the current files.</td></tr>
+<tr><td><code>hco send --run R --name N --text "…" | --file F</code></td><td>A counted follow-up round; exit 4 past the round limit.</td></tr>
+<tr><td><code>hco merge --run R [--name N]... [--dry-run]</code></td><td>Commit each worktree as <code>hco R/N</code>, then <code>git merge --no-ff</code>. Refuses a dirty root, out-of-scope files and unverified workers; aborts cleanly on conflict. <code>--ignore-scope</code>, <code>--skip-checks</code> override.</td></tr>
+<tr><td><code>hco adopt --run R [--quiet]</code></td><td>Take a run over from a new lead terminal.</td></tr>
+<tr><td><code>hco log --run R</code> · <code>hco report --run R</code></td><td>The journal; a Markdown summary and timeline (<code>REPORT.md</code>).</td></tr>
+<tr><td><code>hco cleanup --run R [--worktrees]</code></td><td>Kill + rm run terminals, archive outboxes (remote ones are then deleted on their machine); optionally remove clean merged worktrees. Branches kept.</td></tr>
 </table>
 <h3>hcboard / hcdoc (board mode)</h3>
 <table>
 <tr><th>Command</th><th>Purpose</th></tr>
-<tr><td><code>hcboard.py init e051 --spec s.json</code></td><td>Create the board (planned). <code>--parent e050 --delta '{…}'</code> for a follow-up experiment.</td></tr>
+<tr><td><code>hcboard.py init e051 --spec s.json</code></td><td>Create the board (planned). <code>--parent e050 --delta '{…}'</code> for a follow-up experiment; <code>init e052 --retry-failed e051</code> for only e051's failed jobs.</td></tr>
 <tr><td><code>hc run --bg --name e051-orch --outlive-parent --cwd "$PWD" -- python3 hcboard.py run e051</code></td><td>Start the orchestrator; <code>hc wait e051-orch --timeout 100</code>, <code>hc read e051-orch --lines 40</code>.</td></tr>
-<tr><td><code>hcboard.py status|pause|resume e051</code></td><td>Inspect or steer a running board.</td></tr>
+<tr><td><code>hcboard.py status|pause|resume|cancel e051</code></td><td>Inspect or steer a running board; <code>cancel</code> ends it for good.</td></tr>
 <tr><td><code>hcdoc.py get sk-e051-j007</code></td><td>Print <code>{"value": …, "version": N}</code>.</td></tr>
 <tr><td><code>hcdoc.py watch --label exp=e051</code></td><td>Stream doc and terminal events as JSON lines (<code>snapshot</code>, <code>doc</code>, <code>terminal</code>, <code>heartbeat</code>).</td></tr>
 <tr><td><code>hcdoc.py export e051 out.json</code></td><td>Dump the manifest and all job docs (refuses job names outside the experiment).</td></tr>
@@ -834,21 +946,26 @@ hc run --bg --name lead --cwd "$PWD" codex --no-daemon &amp;&amp; hc attach lead
 
 <h2 id="limits">Known limits &amp; verified facts</h2>
 <ul>
-  <li>Live-tested on hc 0.1.17: one Claude writer (worktree) + one Codex reviewer, and a single Claude worker. Merge phase and <code>--on</code> remote are the least verified.</li>
+  <li><b>Live-tested</b> on hc 0.1.17 (one Claude writer in a worktree plus one Codex reviewer, and a single Claude worker) and on hc 0.1.18 (templates, a Claude and a Codex writer in worktrees, <code>merge</code>, <code>cleanup --worktrees</code>, <code>--scope</code> with a Claude worker, and <code>--on</code> with Claude and Codex workers on a Linux machine).</li>
+  <li><b>Not live-tested:</b> plans, checks, <code>accept</code>, <code>send</code>, <code>adopt</code>, the polling <code>wait</code> and the journal were built and tested against the stand-in hc in <code>tests/fake_hc.py</code> only. They use <code>hc run --no-notify</code>, <code>hc wait &lt;t&gt;</code>, <code>hc get</code>, <code>hc rm</code> and <code>hc send</code> as <code>references/hc-facts.md</code> describes them; <code>CHANGES.md</code> lists the exact assumptions. Run the smoke test once on your hc before relying on them.</li>
+  <li><code>hco check</code> runs local checks only. For a worker on another machine, run its check there and record the outcome with <code>hco accept --force --note</code>.</li>
+  <li>A deadline only flags a worker (<code>NEXT</code>, a note under the table). Nothing is interrupted or killed for you.</li>
+  <li><code>merge</code> commits everything new in a worktree that git doesn't ignore. A worker spawned without <code>--scope</code> is not checked: run <code>hco merge --dry-run</code> first and remove stray files yourself. Scope patterns are relative to the repo root (also for a worker whose <code>--cwd</code> is a subfolder) and always anchored: <code>*.md</code> is root-level only, <code>**/*.md</code> any depth.</li>
+  <li>Remote workers (<code>--on</code>) use direct commands, not templates, and need <code>python3</code> on that machine. <code>hco</code> snapshots the remote checkout at spawn so <code>collect</code> can list what changed, and <code>cleanup</code> deletes the remote outbox after archiving it. <code>--trust</code> is local only.</li>
   <li><b>OSC 7501, verified live</b> (hc 0.1.17, Claude Code 2.1.318, Codex 0.166.0, Ghostty): both agents reach <code>reported: true</code> within seconds and show <code>working</code>/<code>done</code> with turn counts. <code>hc wait --children any|all</code> and <code>hc events</code> react to <code>working</code>, <code>done</code>, <code>error</code>, <code>blocked</code> (kinds <code>permission</code>, <code>question</code>, <code>auth</code>) and <code>progress</code> (integer percent).</li>
   <li><b>Template handshake, verified:</b> <code>hco-claude</code> and <code>hco-codex</code> both returned <code>first_message: {sent: true, started: true}</code> in 3–6 s, and the Claude worker's reply arrived tagged as <code>&lt;hc from="…"&gt;</code>. The failure path (a program that never reports, <code>sent: false</code> after 60 s) is untested.</li>
   <li><b>Scripts as workers:</b> a plain shell script started with <code>hc run --bg -- sh script.sh</code> (by you, or by a Claude or full-access Codex agent) is its own child terminal. It can emit OSC 7501 itself (<code>printf '\033]7501;state=working:progress=25:msg=&lt;base64&gt;\033\\'</code>) and its status is independent of the launching agent's. Run inside an agent's own shell, it can't: the tool shell has no controlling tty, so the escape never reaches the terminal.</li>
   <li><code>hc wait --children any</code> wakes on the <em>first</em> <code>blocked</code> only. Later changes of <code>kind</code> (permission → question → auth) emit status events but no new turn event, so use <code>hc events</code> or <code>hc get</code> to see them. <code>wait --children all</code> also returns for a blocked child.</li>
   <li><code>hco preflight</code> only checks that Codex accepts <code>--no-daemon</code>. It does not check that Codex reports OSC 7501; confirm <code>reported</code> in <code>hc get</code> after a spawn. Without a supporting terminal (tmux drops it unless passthrough is configured), status stays <code>reported: false</code>.</li>
   <li>Install is user-level: skills in <code>~/.claude/skills</code> and <code>~/.agents/skills</code>, templates in <code>~/.config/herdr-core/templates</code>. Rerunning <code>install.sh</code> deletes and replaces the skill folders (it replaces an existing symlink with a copy); use <code>--link</code> to keep a single source.</li>
-  <li>Codex's sandbox blocks <code>hc send</code> ("hc could not start its core: Operation not permitted") — reports travel via outbox files + status events.</li>
+  <li>In <code>--permissions safe</code>, Codex's sandbox blocks <code>hc send</code> ("hc could not start its core: Operation not permitted"), so reports travel via outbox files + status events. In the default bypass mode it works (verified on hc 0.1.18).</li>
   <li>Codex must run with <code>--no-daemon</code>, otherwise <code>$HC_TERMINAL_ID</code> is missing and its hc calls can't route.</li>
-  <li>A fresh worktree triggers Claude's folder-trust dialog; a person must accept it.</li>
-  <li>Board mode was verified live (84 tests, hc 0.1.17); its own limits and verified facts are in <a href="#board">Board mode</a>.</li>
-  <li>Max 4 concurrent workers unless the user asks for more; no two writers share a file; at most 2 fix rounds per worker.</li>
+  <li>A fresh worktree triggers the agent's folder-trust dialog; a person must accept it, unless the worker was spawned with <code>--trust</code>.</li>
+  <li>Board mode's core design was verified live on hc 0.1.17; <code>cancel</code>, <code>--retry-failed</code>, <code>retry_delay_s</code>, <code>pairs</code> and the start-up checks only against <code>tests/fake_core.py</code>. Its own limits are in <a href="#board">Board mode</a>.</li>
+  <li>Max 4 concurrent workers unless the user asks for more (<code>max_parallel</code> in a plan); no two writers that run at the same time share a file; at most 3 rounds per worker (the task plus two follow-ups).</li>
 </ul>
 
-<footer>hc-orchestrate · workflow guide · verified against hc 0.1.17</footer>
+<footer>hc-orchestrate · workflow guide · live-tested on hc 0.1.17 and 0.1.18; plans, checks, rounds and adopt against the fake hc only</footer>
 </main>
 </div>
 <script>
@@ -864,54 +981,64 @@ const PHASES = [
   <p>If one agent could finish in a few steps, <b>do it yourself</b>. Orchestrate only when parts are independent, benefit from a second opinion, or need a long process watched.</p>
   <p>Write <code>.hc-orchestrate/&lt;run&gt;/PLAN.md</code>, one row per worker: name, agent, role, <b>scope</b> (exact files; no two writers share a file), isolation (<code>--worktree</code> for any writer running alongside another), deliverable + proving check, dependencies.</p>
   <ul><li>Pair vendors: Claude-built → Codex reviewer, and vice versa.</li><li>Max 4 concurrent workers.</li><li>Readers share the checkout; writers get worktrees.</li><li>A grid of identical deterministic jobs is <b>one row</b>: propose the <b>board</b> (see Board mode) instead of a worker per job.</li></ul>
+  <p>With three or more workers, or any worker that waits for another, also write <code>plan.json</code> and store it with <code>hco plan --run &lt;run&gt; --file plan.json</code>. It refuses cycles, unknown names and parallel writers whose scopes may share a file (see <a href="#plans">Plans, checks &amp; rounds</a>).</p>
   <p>Show the user a short table and ask to proceed, unless the task already says go.</p>`},
  {n:"2 · Start", h:`
   <h3>Start workers</h3>
   <p><code>hco init --task "..."</code> prints the run id. Write a self-contained task body per worker, then:</p>
-  <pre><code>hco spawn --run &lt;run&gt; --name api --agent claude --role implement --worktree --brief api-task.md</code></pre>
-  <p><code>spawn</code> wraps the body in the worker contract. Read its JSON:</p>
+  <pre><code>hco spawn --run &lt;run&gt; --name api --agent claude --role implement --worktree \\
+  --scope 'src/api/**' 'tests/api/**' --check 'pytest tests/api -q' --brief api-task.md</code></pre>
+  <p>With a stored plan, <code>hco advance --run &lt;run&gt;</code> replaces the <code>spawn</code> calls and says what still waits and why.</p>
+  <p><code>spawn</code> wraps the body in the worker contract. Every writer gets <code>--scope</code> (patterns from the repo root; <code>*</code> stays in a folder, <code>**</code> spans folders) and <code>--check</code> (exit 0 = pass). Read its JSON:</p>
   <ul>
    <li><code>first_message.sent: false</code> (exit 3): the task did <b>not</b> go in. <code>hc read</code> it (usually a trust/login dialog for the user), then <code>hc send &lt;t&gt; "Read &lt;BRIEF.md&gt; and follow it."</code> Never resend blindly.</li>
    <li>Direct launches show no <code>first_message</code>; a silent worker is likely on the trust dialog.</li>
    <li>Name clash: pick another name; never kill strangers.</li>
+   <li>Several spawns at once are safe; a failed spawn removes its worktree and branch, so the name can be retried.</li>
+   <li><code>--deadline &lt;min&gt;</code> flags a long round; <code>--outlive</code> lets workers survive a lead restart; <code>--trust</code> pre-accepts the folder-trust prompt (only if the user trusts the folder).</li>
   </ul>
   <p>Dependent workers start only after their inputs are verified, with the upstream RESULT.md path in the brief.</p>`},
  {n:"3 · Supervise", h:`
   <h3>Supervise</h3>
-  <p>Repeat <code>hco wait --run &lt;run&gt; --timeout 100</code> until every worker is resolved. It returns on the next news with a status table (see the signals table below).</p>
+  <p>Repeat <code>hco wait --run &lt;run&gt; --timeout 100</code> until every worker is resolved. It returns on the next news with a status table whose <code>NEXT</code> column names the next step per worker (see the signals table below).</p>
   <p>Steer with <code>hc send</code> (<code>--if idle</code>), <code>hc interrupt</code>, <code>hc read --lines 100</code>. Do useful work meanwhile.</p>
+  <p>Once a worker has reported, send corrections as a <b>round</b>: <code>hco send --run &lt;run&gt; --name &lt;n&gt; --text "&lt;the concrete error&gt;"</code>. It keeps the old report as <code>STATUS.r1</code>/<code>RESULT.r1.md</code>, drops an earlier accept, and stops after 3 rounds (exit 4).</p>
   <div class="callout"><b class="t">Codex caveat</b>Its reports arrive as STATUS/RESULT.md + status events, not messages. A worker with <code>reported: false</code> never signals completion — rely on its STATUS file and <code>hc read</code>.</div>`},
  {n:"4 · Verify", h:`
   <h3>Verify — never skip</h3>
   <p><code>hco collect --run &lt;run&gt;</code>, then check each claim yourself:</p>
   <ul>
-   <li>Read RESULT.md. Files changed outside scope are a defect, even if helpful. Reviewers must not change files; <code>collect</code> flags it.</li>
+   <li>Read RESULT.md. <code>collect</code> flags files changed outside a worker's <code>--scope</code> and any change by a reviewer: a defect, even if helpful. A worker that reports <code>BLOCKED: needs &lt;path&gt;</code>: hand the file to another worker, or widen this one with <code>hco scope --add</code>.</li>
+   <li><code>hco check --run &lt;run&gt; --name &lt;n&gt;</code> runs the worker's check in an hc terminal and records it with the exact content it ran on (0 passed, 1 failed, 124 still running). A pass stops counting as soon as a file changes.</li>
    <li>Run tests/builds <b>in hc</b>, not your shell:
      <pre><code>hc run --bg --rm --no-notify --name &lt;run&gt;-test --cwd &lt;dir&gt; -- &lt;cmd&gt;
 hc wait &lt;run&gt;-test --timeout 100
 hc read &lt;run&gt;-test --lines 60</code></pre></li>
    <li>For important changes, add a cross-vendor reviewer (scope = the diff).</li>
-   <li>On failure send the worker the concrete error. Max 2 rounds, then report to the user.</li>
+   <li>On failure send the worker the concrete error with <code>hco send</code>. At most 2 follow-up rounds, then report to the user.</li>
+   <li>When you have checked the claims: <code>hco accept --run &lt;run&gt; --name &lt;n&gt; --note "&lt;how&gt;"</code>. It refuses what it can see is wrong (no DONE, check not passed, stray files); planned workers that wait on this one start after it.</li>
   </ul>`},
  {n:"5 · Integrate", h:`
   <h3>Integrate</h3>
   <p>Workers never commit. After verification passes, in dependency order:</p>
-  <pre><code>hco merge --run &lt;run&gt; --name api [--name ui ...]   # omit --name for all, in spawn order</code></pre>
-  <p>For each worker: commit the worktree as <code>hco &lt;run&gt;/&lt;name&gt;</code>, then <code>git merge --no-ff hco/&lt;run&gt;/&lt;name&gt;</code>. Refuses a root with uncommitted tracked changes; on conflict it aborts that merge, leaves the root clean, exits 1.</p>
+  <pre><code>hco merge --run &lt;run&gt; --dry-run                    # first: the files each worker would commit
+hco merge --run &lt;run&gt; --name api [--name ui ...]   # omit --name for all, in spawn order</code></pre>
+  <p>Before committing anything, <code>merge</code> refuses (exit 1) files outside a worker's scope, a check that has not passed on the current files, and files changed after accept (<code>NOT VERIFIED</code>). <code>--ignore-scope</code> and <code>--skip-checks</code> override, and the lead says why in its report. <code>init</code> already keeps common check artifacts (<code>__pycache__/</code>, <code>*.pyc</code>, <code>node_modules/</code>, …) out of merges.</p>
+  <p>For each worker: commit the worktree as <code>hco &lt;run&gt;/&lt;name&gt;</code>, then <code>git merge --no-ff hco/&lt;run&gt;/&lt;name&gt;</code>. Refuses a root with uncommitted tracked changes; on conflict it aborts that merge, leaves the root clean, exits 1. A rerun after a conflict needs no new check.</p>
   <p>Rerun checks after each merge. Resolve conflicts yourself only when the intent is clear; otherwise ask. Don't push, open PRs or delete branches unless asked.</p>`},
  {n:"6 · Report & clean up", h:`
   <h3>Report and clean up</h3>
-  <p>Tell the user briefly: what was done and by whom (paths), what you verified and how (commands, outcomes), and what is unverified, failed or needs a decision. Then:</p>
+  <p>Tell the user briefly: what was done and by whom (paths), what you verified and how (commands, outcomes), and what is unverified, failed or needs a decision. <code>hco report --run &lt;run&gt;</code> gives the recorded facts as Markdown (rounds, STATUS, check, accept, merge commit per worker, then the timeline). Then:</p>
   <pre><code>hco cleanup --run &lt;run&gt;              # kill + rm this run's terminals, archive outboxes
 hco cleanup --run &lt;run&gt; --worktrees  # also remove clean, merged worktrees</code></pre>
   <p>Branches are kept. To inspect a worker, leave its terminal.</p>
-  <div class="callout tip"><b class="t">If the lead restarts</b>Workers end with their lead unless spawned with <code>--outlive</code>. <code>hco status --run &lt;run&gt;</code> and <code>hc ls --label hco.run=&lt;run&gt;</code> show what survived; continue from Supervise.</div>`}
+  <div class="callout tip"><b class="t">If the lead restarts</b>Workers end with their lead unless spawned with <code>--outlive</code>. <code>hco runs</code> finds the run, <code>hco status</code> shows what survived, <code>hco adopt</code> makes the new terminal the lead; continue from Supervise (see <a href="#restart">A restarted lead</a>).</div>`}
 ];
 const BOARD = [
  {n:"1 · Propose", h:`
   <h3>Propose</h3>
   <p>In the plan table, add one row: <i>board — 12 jobs (3 cases × 4 variants), job_cmd <code>./job.sh {case} {variant} {out}</code>, 3 workers</i>. Start nothing until you approve. If <code>job_cmd</code> would reach the mainframe, the answer is no (<code>zowe</code> is refused).</p>
-  <p>Write <code>spec.json</code>: <code>question, cases, variants, job_cmd, max_workers, max_attempts</code> (optional <code>pre, out_dir, job_timeout_s</code>). Keep secrets out.</p>`},
+  <p>Write <code>spec.json</code>: <code>question, cases, variants, job_cmd, max_workers, max_attempts</code> (optional <code>pre, out_dir, job_timeout_s, retry_delay_s, pairs</code>). Set <code>retry_delay_s</code> when failures can be transient, such as rate limits. Keep secrets out.</p>`},
  {n:"2 · Init", h:`
   <h3>Init</h3>
   <pre><code>python3 hcboard.py init e051 --spec spec.json</code></pre>
@@ -919,14 +1046,14 @@ const BOARD = [
  {n:"3 · Run", h:`
   <h3>Run the orchestrator</h3>
   <pre><code>hc run --bg --name e051-orch --outlive-parent --cwd "$PWD" -- python3 hcboard.py run e051</code></pre>
-  <p>It sets the manifest <code>running</code>, <b>subscribes first</b>, then reconciles: lists worker terminals, reads every doc, starts <code>min(3, pending)</code> workers labeled <code>exp=e051 role=worker hco.board=e051</code>. <code>--outlive-parent</code> keeps it alive if you (the lead) restart.</p>
+  <p>It first checks that the end can work (git repo, export path not ignored, git identity, <code>job_cmd</code> starts) and exits 2 with the reason if not. Then it sets the manifest <code>running</code>, <b>subscribes first</b>, and reconciles: lists worker terminals, reads every doc, starts <code>min(3, pending)</code> workers labeled <code>exp=e051 role=worker hco.board=e051</code>. <code>--outlive-parent</code> keeps it alive if you (the lead) restart.</p>
   <p>You wait with <code>hc wait e051-orch --timeout 100</code> and <code>hc read e051-orch --lines 40</code>.</p>`},
  {n:"4 · Claim", h:`
   <h3>Workers claim</h3>
   <p>Each worker reads the manifest (stops unless <code>running</code>), walks <code>jobs</code>, and CAS-claims the first <code>pending</code> one: <code>state=running, owner=$HC_TERMINAL_ID, attempt+=1, started_ms</code>. All three may read j001 at v1; one write lands at v2, the others get <code>conflict</code>, re-read, see <code>running</code> and take j002. No locks, no job claimed twice.</p>`},
  {n:"5 · Results", h:`
   <h3>Run and write results</h3>
-  <p>The worker runs <code>job_cmd</code> with placeholders filled (<code>{out}</code> = <code>runs/e051/&lt;job&gt;.json</code>), logs to <code>runs/e051/&lt;job&gt;.log</code>, then writes the result with a guarded CAS: <code>done</code> + <code>result.out</code> + a short <code>summary</code>. If the command failed: back to <code>pending</code> while <code>attempt &lt; max_attempts</code> (the same worker usually retries at once), else <code>failed</code> with the error tail. Then it loops; with no pending job left it exits 0.</p>`},
+  <p>The worker runs <code>job_cmd</code> with placeholders filled (<code>{out}</code> = <code>runs/e051/&lt;job&gt;.json</code>), logs to <code>runs/e051/&lt;job&gt;.log</code>, then writes the result with a guarded CAS: <code>done</code> + <code>result.out</code> + a short <code>summary</code>. If the command failed: back to <code>pending</code> while <code>attempt &lt; max_attempts</code> (the same worker usually retries at once, or after <code>retry_delay_s</code>, doubled per attempt), else <code>failed</code> with the error tail. Then it loops; with no pending job left it exits 0.</p>`},
  {n:"6 · Crash", h:`
   <h3>When something dies</h3>
   <ul>
@@ -939,11 +1066,13 @@ const BOARD = [
   <h3>Pause and resume</h3>
   <pre><code>python3 hcboard.py pause e051    # manifest running → paused
 python3 hcboard.py resume e051   # paused → running</code></pre>
-  <p>Workers finish their current job and exit instead of claiming another; the orchestrator starts no workers and keeps waiting. On resume, the manifest doc event triggers a reconcile and workers start again.</p>`},
+  <p>Workers finish their current job and exit instead of claiming another; the orchestrator starts no workers and keeps waiting. On resume, the manifest doc event triggers a reconcile and workers start again.</p>
+  <pre><code>python3 hcboard.py cancel e051   # stop for good (ask the user first)</code></pre>
+  <p>Cancel kills the workers and their jobs, fails what is unfinished as <code>cancelled</code>, then exports and archives like a normal end; the last line ends <code>CANCELLED</code>.</p>`},
  {n:"8 · Finish", h:`
   <h3>Finish</h3>
   <p>When nothing is <code>pending</code> or <code>running</code>: manifest <code>done</code> → export <code>experiments/e051.json</code> (checked complete) → <code>git commit</code> of that file → <code>archived</code> → docs written null (versions kept) → finished worker terminals removed. Output ends with <code>HCBOARD e051 COMPLETE done=10 failed=2</code>.</p>
-  <p>Then <b>you verify</b> like phase 4: read the export and the files under <code>runs/e051/</code>; a job doc is a claim. A re-run with changed preconditions is a new experiment: <code>init e052 … --parent e051 --delta '{"macros":true}'</code>.</p>`}
+  <p>Then <b>you verify</b> like phase 4: read the export and the files under <code>runs/e051/</code>; a job doc is a claim. A re-run with changed preconditions is a new experiment: <code>init e052 … --parent e051 --delta '{"macros":true}'</code>. To rerun only the two failures once their cause is fixed: <code>init e052 --retry-failed e051</code>.</p>`}
 ];
 
 /* =================== shared =================== */
@@ -1142,9 +1271,9 @@ rail('#board-btns', '#board-detail', BOARD);
     '<b>1 · Plan.</b> The lead splits the task into pieces and shows you a short table. Nothing starts until you say go.',
     '<b>2 · Start.</b> Each worker gets a written brief and its own terminal. Workers that write code also get their own branch.',
     '<b>3 · Supervise.</b> The lead waits for news. Workers report back. One gets blocked and needs <i>you</i>, so the lead hands the question to you instead of answering for you.',
-    '<b>4 · Verify.</b> Reports are claims. The lead reads each result, checks that files stayed in scope, and runs the tests itself.',
-    '<b>5 · Integrate.</b> Only now does the lead merge each worker\'s branch into main, one at a time.',
-    '<b>6 · Report.</b> The lead tells you what was done, what was checked and what is still open, then cleans up its terminals.'
+    '<b>4 · Verify.</b> Reports are claims. The lead reads each result, checks that files stayed in scope, runs each worker\'s check with <code>hco check</code>, and records its verdict with <code>hco accept</code>.',
+    '<b>5 · Integrate.</b> Only now does the lead merge each worker\'s branch into main, one at a time. <code>merge</code> refuses any worker whose files changed since its check or accept.',
+    '<b>6 · Report.</b> The lead tells you what was done, what was checked and what is still open (<code>hco report</code> has the record), then cleans up its terminals.'
   ];
   const phase = i => {
     chips.forEach((c, j) => { c.classList.toggle('on', i === j); c.classList.toggle('past', j < i); });
@@ -1174,10 +1303,10 @@ rail('#board-btns', '#board-detail', BOARD);
     user.flash(); log.add('you', 'go', 'u');
     await E.packet(user.p('r'), lead.p('l'), { color: C.user, label: 'approve', bend: 20, dur: 700 });
     phase(2); lead.set('active', 'spawning'); pulses();
-    log.add('lead', 'hco spawn --name api --agent claude --worktree', 'l');
+    log.add('lead', 'hco spawn --name api --agent claude --worktree --scope src/api/** --check …', 'l');
     api.show(true); ui.show(true);
     const sa = toW(api, { label: 'BRIEF.md' });
-    await E.wait(300); log.add('lead', 'hco spawn --name ui --agent claude --worktree', 'l');
+    await E.wait(300); log.add('lead', 'hco spawn --name ui --agent claude --worktree --scope src/ui/** --check …', 'l');
     await Promise.all([sa, toW(ui, { label: 'BRIEF.md' })]);
     api.set('working', 't8 working'); ui.set('working', 't9 working');
     log.add('hc', 'first_message <ok>sent ✓ started ✓</ok>', 'h');
@@ -1200,19 +1329,21 @@ rail('#board-btns', '#board-detail', BOARD);
       await toLead(ui, { label: '[hco k3x9/ui] done' }); lead.flash();
     })();
     await Promise.all([runApi, runUi]);
-    log.add('lead', 'hco spawn --name rev --agent codex --cwd wt/api', 'l');
+    log.add('lead', 'hco spawn --name rev --agent codex --role review --cwd wt/api --permissions safe', 'l');
     rev.show(true); await toW(rev, { label: 'review brief' });
     rev.set('working', 't10 working'); await progress(E, rev, 3000);
-    rev.set('done', 'done'); log.add('rev', 'RESULT.md: 2 findings <er>(hc send refused by sandbox)</er>', 'w');
+    rev.set('done', 'done'); log.add('rev', 'RESULT.md: 2 findings <er>(safe mode: hc send refused by sandbox)</er>', 'w');
     await toLead(rev, { label: 'outbox file only' }); lead.flash();
-    log.add('lead', 'agrees with 1 of 2 → hc send t8 "fix: …"', 'l');
-    await toW(api, { label: 'fix: null session' });
-    api.set('working', 't8 fixing').prog(0); await progress(E, api, 1600);
+    log.add('lead', 'agrees with 1 of 2 → hco send --name api --file findings.md', 'l');
+    log.add('hco', 'round 2 · FOLLOWUP.r2.md · old report kept as STATUS.r1', 'h');
+    await toW(api, { label: 'round 2: null session' });
+    api.set('working', 't8 round 2').prog(0); await progress(E, api, 1600);
     api.set('done', 'done'); await toLead(api, { label: 'fixed' });
-    phase(4); lead.set('active', 'verifying'); log.add('lead', 'hco collect · scope check <ok>✓</ok>', 'l');
-    await E.wait(700); log.add('hc', 'k3x9-test: npm test → <ok>42 passed</ok>', 'h'); lead.flash();
+    phase(4); lead.set('active', 'verifying'); log.add('lead', 'hco collect · <ok>scope ok</ok> (src/api/**) · (src/ui/**)', 'l');
+    await E.wait(700); log.add('hc', 'hco check api → <ok>exit 0</ok> · ui → <ok>exit 0</ok> (on these files)', 'h'); lead.flash();
+    await E.wait(700); log.add('lead', 'hco accept api, ui --note "read diffs, checks passed"', 'l');
     await E.wait(800);
-    phase(5); lead.set('active', 'merging');
+    phase(5); lead.set('active', 'merging'); log.add('lead', 'hco merge --dry-run · <ok>gates pass</ok>', 'l');
     for (const w of [api, ui]) {
       log.add('lead', `hco merge → commit "hco k3x9/${w === api ? 'api' : 'ui'}" · merge --no-ff`, 'd');
       await E.packet(w.p('b', -40), main.p('r', -10), { color: C.done, label: `hco/k3x9/${w === api ? 'api' : 'ui'}`, bend: -40, dur: 1200 });
@@ -1221,7 +1352,7 @@ rail('#board-btns', '#board-detail', BOARD);
     main.set('done', '2 merges').sub('re-ran checks ✓');
     phase(6); lead.set('active', 'reporting');
     await E.packet(lead.p('l', 8), user.p('r', 8), { color: C.lead, label: 'done · verified · 1 open item', bend: 20, dur: 1200 });
-    user.flash(); log.add('lead', 'hco cleanup --run k3x9 · branches kept', 'l');
+    user.flash(); log.add('lead', 'hco report → REPORT.md · hco cleanup --run k3x9 · branches kept', 'l');
     W.forEach(w => w.set('', '').show(false)); lead.set('', 'idle');
     await E.wait(4500); play();
   }
@@ -1474,6 +1605,54 @@ rail('#board-btns', '#board-detail', BOARD);
     await E.wait(2200); on('pending'); say('another job: pending → running → <b>done</b>, result written only if owner and attempt still match');
     await E.wait(900); await go('claim', C.worker, 'a1 · t20'); on('running'); await E.wait(1300); await go('ok', C.done, 'result'); on('done');
     await E.wait(3000); play();
+  }
+  E.onFirstShow = play; bindControls(stage, E);
+})();
+
+/* =================== stage 5: a worker's gates =================== */
+(function gateStage() {
+  const svg = $('#gate-svg'), stage = $('#gate-stage'), cap = $('#gate-cap');
+  const wires = el('g', {}, svg), nodes = el('g', {}, svg);
+  const xs = [80, 228, 376, 524, 672, 820], Y = 150;
+  const spec = [['planned', 'hco plan', C.pending], ['working', 'round n', C.worker], ['reported', 'STATUS DONE', C.event],
+                ['checked', 'exit 0 · tree id', C.store], ['accepted', 'hco accept', C.lead], ['merged', 'commit + merge', C.done]];
+  const S = {};
+  spec.forEach(([k, sub, c], i) => { S[k] = makeNode(nodes, { x: xs[i], y: Y, w: 124, h: 56, title: k, sub, color: c }); });
+  const L = {
+    advance: [S.planned.p('r'), S.working.p('l'), 0],
+    done: [S.working.p('r'), S.reported.p('l'), 0],
+    check: [S.reported.p('r'), S.checked.p('l'), 0],
+    accept: [S.checked.p('r'), S.accepted.p('l'), 0],
+    merge: [S.accepted.p('r'), S.merged.p('l'), 0],
+    send: [S.reported.p('t', -14), S.working.p('t', 14), 60],
+    send2: [S.checked.p('t', -14), S.working.p('t', -14), 120],
+    changed: [S.accepted.p('b'), S.reported.p('b'), -130],
+  };
+  Object.values(L).forEach(([a, b, k]) => wire(wires, a, b, k));
+  const lbl = (x, y, t, c) => { const e = el('text', { class: 'svg-note', x, y, 'text-anchor': 'middle', style: `fill:${c}` }, svg); e.textContent = t; };
+  lbl(154, 199, 'advance', C.lead); lbl(302, 199, 'report', C.event); lbl(450, 199, 'hco check', C.store);
+  lbl(598, 199, 'accept', C.lead); lbl(746, 199, 'hco merge', C.done);
+  lbl(302, 84, 'hco send (round 2)', C.lead); lbl(362, 46, 'hco send after a failed review', C.lead);
+  lbl(524, 268, 'a file changed: check and accept no longer count', C.fail);
+  const E = new Engine(svg);
+  const say = h => { cap.classList.remove('swap'); void cap.offsetWidth; cap.innerHTML = h; cap.classList.add('swap'); };
+  const on = k => Object.entries(S).forEach(([n, s]) => s.set(n === k ? 'on' : '', n === k ? '●' : ''));
+  const go = (k, color, label) => { const [a, b, bend] = L[k]; return E.packet(a, b, { color, label, bend, dur: 1300 }); };
+  async function play() {
+    E.reset(); E.top(); on('planned'); say('<b>planned</b>: stored by <code>hco plan</code>; waits until every <code>after</code> entry holds'); await E.wait(1500);
+    say('<code>hco advance</code> starts it: brief, scope and check go to the worker'); await go('advance', C.lead, 'spawn'); on('working');
+    await E.wait(1300); say('the worker reports <b>DONE</b>: a claim'); await go('done', C.event, 'DONE'); on('reported');
+    await E.wait(1300); say('<code>hco check</code> fails (exit 1): the lead sends the concrete error as <b>round 2</b>');
+    await go('send', C.lead, 'round 2'); on('working');
+    await E.wait(1200); say('round 2 reported; the old report is kept as <code>STATUS.r1</code>'); await go('done', C.event, 'DONE'); on('reported');
+    await E.wait(1200); say('<code>hco check</code> exits 0 and records the <b>tree id</b> of the files it ran on'); await go('check', C.store, 'exit 0'); on('checked');
+    await E.wait(1300); say('<code>hco accept --note "…"</code>: the lead\'s verdict, tied to the same tree id'); await go('accept', C.lead, 'accept'); on('accepted');
+    await E.wait(1500); say('something edits a file after accept: the tree id differs, so <code>merge</code> would say <b>NOT VERIFIED</b>');
+    await go('changed', C.fail, 'file changed'); on('reported');
+    await E.wait(1300); say('check again, accept again'); await go('check', C.store, 'exit 0'); on('checked');
+    await go('accept', C.lead, 'accept'); on('accepted');
+    await E.wait(1100); say('<code>hco merge</code>: scope ok, check and accept still match the files → commit and <code>merge --no-ff</code>'); await go('merge', C.done, 'merge'); on('merged');
+    await E.wait(3200); play();
   }
   E.onFirstShow = play; bindControls(stage, E);
 })();
