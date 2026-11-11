@@ -25,12 +25,11 @@ HC = shutil.which("hc")
 LIVE = bool(HC) and os.environ.get("HCDOC_NO_LIVE") != "1"
 SKIP_WHY = "hc not installed or HCDOC_NO_LIVE=1"
 
-# A template whose "agent" is tests/worker_bot.py. `ready: quiet` because the bot reports no OSC 7501
-# status for the core to wait on.
+# A template whose "agent" is tests/worker_bot.py. Default readiness: the bot reports OSC 7501 `idle` when it
+# is ready, as Claude Code does, and core then types the task in.
 BOT_TEMPLATE = f"""---
 description: hco live tests: scripted stand-in for an agent worker
 command: exec {sys.executable} -I {BOT}
-ready: quiet
 ---
 """
 

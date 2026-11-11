@@ -14,12 +14,15 @@ own labels (`hc get $HC_TERMINAL_ID`), reads its BRIEF.md and acts on one line i
   status     the STATUS line to report (default DONE)
 
 Then it writes RESULT.md (what it did, its inbox, every command's output), STATUS, and reports to its
-lead with `hc send`, exactly as a brief tells an agent to, and stays open like an idle agent. If it
+lead with `hc send`, exactly as a brief tells an agent to, and stays open like an idle agent. Like
+Claude Code and Codex it reports OSC 7501 status: idle when ready for the task, working while it works,
+idle when the turn is over. If it
 crashes, STATUS says `FAILED: worker_bot crashed: <error>` and RESULT.md holds the traceback.
 """
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -38,6 +41,22 @@ def sh(*argv):
 
 def team(run, me, verb, *args):
     return sh(sys.executable, "-I", str(HCTEAM), verb, "--run", run, "--as", me, *args)
+
+
+def status(state):
+    """Report an OSC 7501 program status, as Claude Code and Codex do. hc's template launch waits for the
+    first report before it types the task in; `hco wait` gets turn events from the later ones."""
+    sys.stdout.write(f"\x1b]7501;state={state}:app=hcobot\x1b\\")
+    sys.stdout.flush()
+
+
+def wait_for_input(timeout):
+    """True once a line was typed into the terminal (the task, or a follow-up), False after timeout."""
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    if r:
+        sys.stdin.readline()
+        return True
+    return False
 
 
 def main():
@@ -92,12 +111,19 @@ def main():
 
 def stay():
     """Stay open after reporting, as an agent does: hc counts a program that exits before it is ready as
-    a failed launch (first_message.sent false), and the lead may still send follow-ups. Killed by cleanup."""
+    a failed launch (first_message.sent false), and the lead may still send follow-ups. Each one is a turn
+    that ends at once. Killed by cleanup."""
+    status("idle")
     while True:
-        time.sleep(3600)
+        if wait_for_input(3600):
+            status("working")
+            status("idle")
 
 
 if __name__ == "__main__":
+    status("idle")  # ready for the task
+    wait_for_input(20)  # the task as typed in; the work itself comes from BRIEF.md, so go on without it
+    status("working")
     try:
         main()
     except Exception:  # report the crash where the lead and the tests look, then stay open

@@ -29,6 +29,11 @@ If your hc is newer and disagrees, `hc --skill` and `hc <cmd> --help` win.
   the agent CLI, which starts with it as its first prompt. No
   `first_message` field. Both `claude "query"` and `codex "prompt"` start an
   interactive session with that prompt.
+- Readiness (herdr-core `docs/templates.md`, read 2026-11-11): by default core waits for the program's
+  first OSC 7501 report before typing the opening message, up to 30 s, then leaves the screen alone and
+  reports `first_message.sent: false`. `ready: quiet` waits for output to settle instead; a program that
+  prints nothing never settles (seen on hc 0.1.20 in CI: "its output never went quiet"), and one that
+  exits first gets "it exited before it was ready". A scripted worker should report `state=idle` itself.
 - `--json` on `run` prints the RunResult JSON (the terminal record plus
   `first_message`).
 - Templates: `~/.config/herdr-core/templates/<name>.md`. Header is line-based
