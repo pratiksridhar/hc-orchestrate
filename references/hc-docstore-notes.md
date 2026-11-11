@@ -61,25 +61,31 @@ separate mode for deterministic `job_cmd` batches and touches none of this.
 - The worker retries its own failures (`failed` → `pending` while
   `attempt < max_attempts`); the orchestrator only requeues crashed owners.
 
-## Notes board (hcnotes.py; fake-core tests only)
+## Team mode (hcteam.py; fake-core tests only)
 
-A second, unrelated user of the doc store: the workers of an `hco` run (LLM agents, not board jobs)
-leave each other short posts. Built on the facts above:
+A second, unrelated user of the doc store: the workers of an `hco init --team` run (LLM agents, not
+board jobs) share a task list and mail. Modelled on Claude Code's agent teams
+(code.claude.com/docs/en/agent-teams, read 2026-11-11), built on the facts above:
 
-- **Docs:** `sk-<run>-notes` marks the board as open; each post is its own doc `sk-<run>-m001` ...
-  `-m200`, created with `doc.set` at version 0 (A2). Two writers that pick the same slot: one gets
-  `conflict` and takes the next. No doc is ever rewritten, so there is no read-modify-write loop.
-- **No listing call exists** (A6: `doc.get`, `doc.set` only), so readers walk the slots from 1 (or
-  from `--since`) until the first never-written one (`value: null, version: 0`, A1). A deleted slot
-  (`null`, version > 0, A3) is skipped. A full read of 200 posts is 201 `doc.get` calls.
-- **Run ids repeat across repos**, and the store is one per core: `hco init --notes` takes a run id
-  only if its marker doc is at version 0, i.e. was never used on this core.
-- **Events are not used.** Workers read at three points of their work; the lead's `wait`/`status`
-  read the slots after the last post it was shown.
-- **Close:** `hco cleanup` deletes the marker first (posting then fails with exit 3), then reads,
-  archives and deletes the posts. Cleanup kills the run's terminals before that, so nobody is left
-  to post; a post that still lands after the read (a worker that outlived the kill) stays in the
-  store as a stray `sk-<run>-mNNN` doc. A cleanup that failed halfway can be run again.
+- **Docs:** `sk-<run>-team` (members: name -> terminal, role, agent, and how far it has read the
+  mail), one doc per task `sk-<run>-t001` ... `-t100`, one per message `sk-<run>-m001` ... `-m400`.
+  New ones are created with `doc.set` at version 0 (A2): two writers that pick the same slot, one
+  gets `conflict` and takes the next.
+- **Claim** is `hcdoc`'s compare-and-set update on the task doc (pending and unassigned or assigned
+  to the claimer -> in_progress, owner set), the same mechanism as the board's job claim. Agent teams
+  use a file lock for this. "Blocked" is not stored: it is computed from `after` on every read.
+- **No listing call exists** (A6), so readers walk the slots from 1 (mail: from the reader's cursor)
+  until the first never-written one (`value: null, version: 0`, A1); a deleted slot is skipped.
+  A worker command costs the team doc, the mail after its cursor and, for task commands, every task.
+- **Delivery:** the message is stored, then the sender's process runs `hc send <terminal> "<one
+  line naming the inbox command>" --if idle` for each recipient. The text of the message is never
+  typed into a terminal. Not verified on a real hc: the exit code of `--if idle` when the target is
+  working (ignored either way) and how long it holds.
+- **Run ids repeat across repos**, and the store is one per core: `hco init --team` takes a run id
+  only if its team doc is at version 0, i.e. was never used on this core.
+- **Close:** `hco cleanup` deletes the team doc first (every command then exits 3), reads tasks and
+  mail, writes `team.json`, then deletes them. Cleanup kills the run's terminals before that; a
+  write that still lands after the read stays as a stray doc. A failed cleanup can be run again.
 - **Not covered:** workers on another machine (`doc.get` takes `on`, but the script is not there),
   and `--permissions safe` workers (Codex's sandbox blocks the socket, see hc-facts).
 

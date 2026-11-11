@@ -3,32 +3,45 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
-## Notes board: workers share short facts — fake-core tests only, NOT live-tested
+## Team mode: shared task list and mail — fake-core tests only, NOT live-tested
 
-Opt-in with `hco init --notes`; a run without it behaves exactly as before and never touches the doc store.
+Opt-in with `hco init --team`; a run without it behaves exactly as before and never touches the doc store.
+Modelled on Claude Code's agent teams (shared task list, mailbox); README has the side-by-side table.
 
 ### Added
-- `scripts/hcnotes.py`: `read --run R [--since N]` and `post --run R --from NAME --kind KIND [--re N] TEXT`.
-  Kinds `FINDING`, `INTERFACE`, `QUESTION`, `ANSWER`. One line of at most 500 characters (control characters
-  removed), 20 posts an author, 200 a run. One doc per post, written with compare-and-set at version 0.
-- `hco init --notes` opens the board (exit 4 and nothing created when the core has no doc store). The brief
-  of every local bypass-mode worker gets a "Shared notes board" section: when to read, what to post, and that
-  posts are unverified claims that never override scope or rules. `--on` and `--permissions safe` workers get
-  no board and `spawn` warns.
-- `hco notes --run R` (the lead's view; `--post`, `--re`, `--kind` to add its own), a `=== notes board`
-  section at the end of `hco collect`, a `notes: n new post(s)` line under the `wait`/`status` table, one
-  `note` entry per post in the journal, and `cleanup` archives the posts to `notes.json` and deletes the docs.
-- Author check: a post records `$HC_TERMINAL_ID`; the lead's views flag a post whose author is not a worker
-  of the run or whose terminal is not the one `hco` started for that worker.
+- `scripts/hcteam.py`, what a member runs: `claim [ID]`, `done ID --note`, `release ID --why`, `tasks`,
+  `inbox`, `send --to NAME|lead|all TEXT`, `members`. A member acts under its own name only (its
+  `$HC_TERMINAL_ID` must be the terminal `hco` started for that name) and holds one task at a time.
+- Tasks: pending, in progress, completed, cancelled; `after` (wait for other tasks) and an optional assignee.
+  Claiming is a compare-and-set on the task's doc. One doc per task and per message.
+- `hco task add|assign|reopen|cancel`, `hco tasks`, `hco mail` (reads every message, `--to NAME TEXT` sends).
+  `task add --file` takes a JSON list whose entries can depend on each other by key.
+- Mail is stored first; recipients are then told with `hc send --if idle`, so a working agent is not
+  interrupted and learns of its mail from the `mail: n unread` line under its next team command. Idle
+  members are told the same way when a task opens for them (added, assigned, reopened, unblocked).
+- `init --team` (exit 4 and nothing created when the core has no doc store); the brief of every local
+  bypass-mode worker gets a "Your team" section; `--on` and `--permissions safe` workers are not members and
+  `spawn` warns. `lead` and `all` are refused as worker names in a team run.
+- Under the `wait`/`status` table: unread mail, the task summary, and a note for a worker whose STATUS says
+  DONE while it holds a task again. `collect` lists tasks and mail. `accept` refuses a worker that holds a
+  task. `adopt` moves the lead's mailbox to the new terminal. Every message and every task change lands in
+  the journal once. `cleanup` archives to `team.json`, then deletes the docs.
+
+### Decisions
+- An earlier version of this branch had a broadcast-only "notes board" with post kinds
+  (`init --notes`, `hcnotes.py`). It is replaced by this; `send --to all` covers the broadcast.
+- Different from agent teams on purpose: the lead reads all mail, only the lead adds tasks, writers keep
+  their worktrees and scopes, and there are hard limits (100 tasks, 400 messages, 40 per worker).
 
 ### Tests and limits
-- `tests/test_hcnotes.py`, 16 tests against `fake_core.py` + `fake_hc.py`: posting from four processes at
-  once, limits, the brief, author flags, the journal, an unreachable store, cleanup and its rerun.
-- Not tested: a real core, and real agents. Whether workers post useful things, read at the right moments
-  or flood the board is unknown; a real run should count the posts that changed what another worker did.
-- `--kind BLOCKED` from the first sketch was dropped: a blocked worker must tell the lead through STATUS,
-  and a second place to say it would hide it. `ANSWER` was added so a `QUESTION` can be closed.
-- `hc-orchestrate-workflow.html` does not show the notes board yet.
+- `tests/test_hcteam.py`, 22 tests against `fake_core.py` + `fake_hc.py`: four processes claiming three
+  tasks, dependencies, assignment, release, reopen, cancel, acting under another name, mail to one, to all
+  and to the lead, the nudges, author flags, the journal, an unreachable store, cleanup and its rerun.
+- Not tested: a real core, real agents, and `hc send --if idle` itself. Whether workers follow the
+  claim/done loop and keep mail short is unknown; the agent-teams docs name lagging task status as a known
+  problem. A first real run should use 2-3 workers and read `hco tasks` and `hco mail` often.
+- Task dependencies order work but do not move code: writers' worktrees only meet at `merge`.
+- `hc-orchestrate-workflow.html` does not show team mode yet.
 
 ## Board mode: fail early, cancel, retry only what failed — fake-core tests only, NOT live-tested
 
