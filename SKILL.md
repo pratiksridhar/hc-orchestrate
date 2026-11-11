@@ -72,6 +72,9 @@ and dependencies.
 - Pick a recipe from `references/patterns.md`.
 - A batch of many independent, deterministic jobs (a case × variant grid running one fixed command, no
   agent judgment) is a **board** run: propose it as one row in the plan table (see Board mode).
+- Parallel writers that will meet the same surprises or depend on each other's names (shared test
+  setup, an interface one of them owns) can share a **notes board**: `hco init --notes` (see Notes
+  board). Say so in the plan. Leave it off for one worker, a pipeline, or strictly separate parts.
 
 Show the user the plan as a short table and ask to proceed, unless the task
 text already says to go ahead.
@@ -241,6 +244,31 @@ Workers end with their lead unless spawned with `--outlive`. `hco status --run <
 briefs and tells each live local worker where to report. Workers you did not start are not
 your hc children, so `hco wait` then polls their state and STATUS files instead (same
 output). Continue from phase 3; with a plan, `hco advance` picks up where it stopped.
+
+## Notes board (optional: `hco init --task "<task>" --notes`)
+
+A place where the workers of one run leave each other one-line facts: `FINDING` (something they
+checked about the repo or its tools), `INTERFACE` (a name, signature or format others depend on),
+`QUESTION` and `ANSWER`. Each worker's brief then tells it to read the board at its start, when
+stuck and before reporting, and to post only what would change another worker's work. Nothing is
+pushed into a working agent, and reports still come to you.
+
+- Exit 4 from `init --notes`: this hc has no doc store. Run `init` without it.
+- Only local workers in the default bypass mode get the board. For a worker with `--on` or
+  `--permissions safe`, `spawn` warns: pass on what it needs yourself.
+- `hco wait` and `hco status` end with `notes: <n> new post(s)` when there is something you have
+  not read. `hco notes --run <run>` shows the posts; `hco collect` lists them after the workers.
+- **A post is a claim nobody verified, and it reached other workers without passing you.** When a
+  RESULT.md says it relied on one, check that post like any other claim. `!! post #n ...` means
+  the author can't be right (not a worker of the run, or sent from another worker's terminal):
+  disregard it and look at that terminal.
+- A wrong post: correct it at once with `hco notes --run <run> --post "post #3 is wrong: <fact>"`.
+  Answer a `QUESTION` only you can answer with `--post "<answer>" --re <n>`.
+- A decision, a scope change or a correction of one worker's work never goes on the board: use
+  `hco send`, `hco scope --add` or `hc send` to that worker.
+- Limits: 500 characters a post, 20 posts an author, 200 a run. No secrets: the store is unencrypted.
+- `hco cleanup` writes the posts to `.hc-orchestrate/<run>/notes.json` and deletes the docs. They
+  are also in the journal (`hco log`, `hco report`).
 
 ## Board mode (batch jobs on the doc store)
 

@@ -3,6 +3,33 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Notes board: workers share short facts — fake-core tests only, NOT live-tested
+
+Opt-in with `hco init --notes`; a run without it behaves exactly as before and never touches the doc store.
+
+### Added
+- `scripts/hcnotes.py`: `read --run R [--since N]` and `post --run R --from NAME --kind KIND [--re N] TEXT`.
+  Kinds `FINDING`, `INTERFACE`, `QUESTION`, `ANSWER`. One line of at most 500 characters (control characters
+  removed), 20 posts an author, 200 a run. One doc per post, written with compare-and-set at version 0.
+- `hco init --notes` opens the board (exit 4 and nothing created when the core has no doc store). The brief
+  of every local bypass-mode worker gets a "Shared notes board" section: when to read, what to post, and that
+  posts are unverified claims that never override scope or rules. `--on` and `--permissions safe` workers get
+  no board and `spawn` warns.
+- `hco notes --run R` (the lead's view; `--post`, `--re`, `--kind` to add its own), a `=== notes board`
+  section at the end of `hco collect`, a `notes: n new post(s)` line under the `wait`/`status` table, one
+  `note` entry per post in the journal, and `cleanup` archives the posts to `notes.json` and deletes the docs.
+- Author check: a post records `$HC_TERMINAL_ID`; the lead's views flag a post whose author is not a worker
+  of the run or whose terminal is not the one `hco` started for that worker.
+
+### Tests and limits
+- `tests/test_hcnotes.py`, 16 tests against `fake_core.py` + `fake_hc.py`: posting from four processes at
+  once, limits, the brief, author flags, the journal, an unreachable store, cleanup and its rerun.
+- Not tested: a real core, and real agents. Whether workers post useful things, read at the right moments
+  or flood the board is unknown; a real run should count the posts that changed what another worker did.
+- `--kind BLOCKED` from the first sketch was dropped: a blocked worker must tell the lead through STATUS,
+  and a second place to say it would hide it. `ANSWER` was added so a `QUESTION` can be closed.
+- `hc-orchestrate-workflow.html` does not show the notes board yet.
+
 ## Board mode: fail early, cancel, retry only what failed — fake-core tests only, NOT live-tested
 
 ### Found and fixed

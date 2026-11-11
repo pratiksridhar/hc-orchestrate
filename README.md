@@ -87,6 +87,7 @@ What the skill relies on:
 | Run state | `run.json` is written under a lock with a fresh read (parallel `spawn` calls are safe), a failed spawn rolls its worktree back, every action lands in a journal (`hco log`, `hco report`), and a restarted lead takes the run over with `hco runs` + `hco adopt`. |
 | Worker contract | Every brief carries scope rules, "no sub-agents", your policy, and a **two-channel report**: files in an outbox (`RESULT.md` + `STATUS`) and a one-line `hc send` prefixed `[hco <run>/<name>]`. |
 | Scope check | `spawn --scope 'src/auth/**'` records the files a writer may change and lists them in its brief; `collect` flags any other file it changed (renames and deletions included) and `merge` refuses to commit them. `hco scope --add` widens one worker's scope. |
+| Notes board | Optional (`hco init --notes`): the workers of a run leave each other one-line findings, interface changes, questions and answers in herdr-core's doc store (`scripts/hcnotes.py`). The lead sees every post in `collect`, `hco notes` and the journal. See [below](#notes-board-workers-share-short-facts). |
 | `scripts/hcboard.py`, `docstore_worker.py`, `hcdoc.py` | **Board mode** (stdlib Python): the orchestrator loop, the job-claiming worker and the guarded doc-store helper they share. See below. |
 | `templates/hco-claude.md`, `hco-codex.md` | hc templates so core waits for the agent to be ready before handing it the task, and tells the lead if it didn't go in. |
 | `references/` | Orchestration recipes, the verified hc facts the skill depends on, and the doc-store notes behind board mode. |
@@ -156,6 +157,54 @@ sequenceDiagram
     L->>O: hco collect: read RESULT.md, diff vs. scope
     Note over L: the report is a claim: verify before trusting it
 ```
+
+## Notes board: workers share short facts
+
+Without it, workers only talk to the lead. Two parallel writers then each find out on their own
+that the tests need a certain fixture, and nobody hears that a shared function was renamed until
+the merge. With `hco init --task "..." --notes` the run gets a board that every worker can read and
+post to.
+
+```mermaid
+flowchart LR
+    w1["Worker api"] -->|"post"| board
+    w2["Worker ui"] -->|"post"| board
+    board[("<b>Notes board</b><br/>hc doc store<br/>sk-&lt;run&gt;-m001, -m002, …")]
+    board -.->|"read: at start,<br/>when stuck,<br/>before reporting"| w1
+    board -.->|"read"| w2
+    board -->|"hco notes · collect<br/>journal"| lead["<b>Lead</b><br/>sees every post,<br/>corrects wrong ones"]
+    w1 -->|"RESULT.md + STATUS<br/>(unchanged)"| lead
+    w2 -->|"RESULT.md + STATUS"| lead
+```
+
+- **Four kinds of post, one line each** (at most 500 characters): `FINDING` (a fact about the repo
+  or its tools the worker checked), `INTERFACE` (a name, signature or file format others depend
+  on), `QUESTION`, and `ANSWER --re <n>`.
+- **Pull, not push.** A worker reads the board at its start, when stuck and before reporting.
+  Nothing interrupts a working agent, and no worker waits for an answer.
+- **Not a second report channel.** RESULT.md, STATUS, checks, `accept` and `merge` work as before.
+- **Posts are claims.** The brief tells workers to check a post against the code, never to leave
+  their scope because of one, and to name the posts they relied on in RESULT.md.
+- **The lead sees all of it.** `wait` and `status` say when there are unread posts, `hco notes`
+  and `collect` list them, each post lands in the journal once, and the lead can post corrections
+  and answers (`hco notes --run <run> --post "..."`).
+- **Authors are checked.** A post records the terminal it came from. `!! post #n ...` marks one
+  whose author is not a worker of the run or that came from another worker's terminal.
+- **Bounded.** 20 posts an author and 200 a run; `cleanup` archives them to
+  `.hc-orchestrate/<run>/notes.json` and deletes the docs.
+
+```sh
+hco init --task "rate limiting for the public API" --notes   # exit 4: this hc has no doc store
+hco notes --run k3x9                                          # every post, flags included
+hco notes --run k3x9 --post "yes: tests/conftest.py mocks it" --re 2
+# what a worker runs (the exact commands are in its brief):
+python3 $S/hcnotes.py read --run k3x9 --since 3
+python3 $S/hcnotes.py post --run k3x9 --from api --kind INTERFACE "getUser is now fetchUser(id, opts)"
+```
+
+Who gets it: local workers in the default bypass mode. A worker on another machine (`--on`) has
+neither this core's doc store nor the script, and in `--permissions safe` the command would stop
+Claude at a permission prompt and Codex's sandbox blocks the core's socket; `spawn` warns for both.
 
 ## Board mode: batch jobs on the doc store
 
@@ -433,6 +482,7 @@ report that arrived between two waits is still returned as a change.
   plan/<worker>.md                     brief copies of a stored plan (hco plan)
   checks/<worker>.log                  output of the worker's last check
   REPORT.md                            written by hco report
+  notes.json                           the notes board's posts, written by cleanup (init --notes)
   wt/<worker>/                         git worktree, branch hco/<run>/<worker>
   workers/<worker>/BRIEF.md            copy of each brief; outboxes archived here on cleanup
 <worker cwd>/.hc-orchestrate/<run>/out/<worker>/
@@ -451,6 +501,10 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
   they were written. They use `hc run --no-notify`, `hc wait <t>`, `hc get`, `hc rm` and
   `hc send` as `references/hc-facts.md` describes them. Run the smoke test below once on your hc
   before relying on them; see CHANGES.md for the exact assumptions.
+- The notes board (`init --notes`, `hco notes`, `hcnotes.py`) was tested against `tests/fake_core.py`
+  and `tests/fake_hc.py` only, with scripted posts. Not yet seen: a real core, and whether real
+  agents post usefully or too much. Workers can still be misled by a wrong post before the lead
+  corrects it; the author check is advisory (a bypassed worker can set its own `HC_TERMINAL_ID`).
 - `hco check` runs local checks only. For a worker on another machine run its check there and
   record the outcome with `hco accept --force --note`.
 - A deadline only flags a worker (`NEXT`, a note under the table). Nothing is interrupted or

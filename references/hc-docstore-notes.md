@@ -61,6 +61,28 @@ separate mode for deterministic `job_cmd` batches and touches none of this.
 - The worker retries its own failures (`failed` → `pending` while
   `attempt < max_attempts`); the orchestrator only requeues crashed owners.
 
+## Notes board (hcnotes.py; fake-core tests only)
+
+A second, unrelated user of the doc store: the workers of an `hco` run (LLM agents, not board jobs)
+leave each other short posts. Built on the facts above:
+
+- **Docs:** `sk-<run>-notes` marks the board as open; each post is its own doc `sk-<run>-m001` ...
+  `-m200`, created with `doc.set` at version 0 (A2). Two writers that pick the same slot: one gets
+  `conflict` and takes the next. No doc is ever rewritten, so there is no read-modify-write loop.
+- **No listing call exists** (A6: `doc.get`, `doc.set` only), so readers walk the slots from 1 (or
+  from `--since`) until the first never-written one (`value: null, version: 0`, A1). A deleted slot
+  (`null`, version > 0, A3) is skipped. A full read of 200 posts is 201 `doc.get` calls.
+- **Run ids repeat across repos**, and the store is one per core: `hco init --notes` takes a run id
+  only if its marker doc is at version 0, i.e. was never used on this core.
+- **Events are not used.** Workers read at three points of their work; the lead's `wait`/`status`
+  read the slots after the last post it was shown.
+- **Close:** `hco cleanup` deletes the marker first (posting then fails with exit 3), then reads,
+  archives and deletes the posts. Cleanup kills the run's terminals before that, so nobody is left
+  to post; a post that still lands after the read (a worker that outlived the kill) stays in the
+  store as a stray `sk-<run>-mNNN` doc. A cleanup that failed halfway can be run again.
+- **Not covered:** workers on another machine (`doc.get` takes `on`, but the script is not there),
+  and `--permissions safe` workers (Codex's sandbox blocks the socket, see hc-facts).
+
 ## Board implementation notes (hcboard.py, docstore_worker.py)
 
 - **Files:** `scripts/hcdoc.py` (guarded doc access), `scripts/docstore_worker.py` (claims and runs jobs),
