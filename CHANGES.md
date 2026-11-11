@@ -3,7 +3,7 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
-## Live tests on a real hc, with scripted and real Claude workers — written, NOT yet run
+## Live tests on a real hc, with scripted and real Claude workers — scripted ones pass on hc 0.1.20 in CI; real-Claude ones NOT yet run
 
 - `tests/live_support.py`: an isolated real core per test class, a git repo and a `lead` terminal per test;
   hco runs as that lead, so workers are its real hc children.
@@ -14,8 +14,13 @@ of this repo, formerly shipped as a zip).
   two team members in separate worktrees passing a word through the mailbox.
 - CI: every job installs hc 0.1.20 (checksum pinned in the workflow), so the live tests run there. A new
   `agents` job runs the real-Claude tests on pushes and by hand when the `ANTHROPIC_API_KEY` secret exists.
-- Not run yet: installing hc in the session that wrote these was refused by its permission checks, so their
-  first run is CI's. The `agents` job pre-answers Claude Code's first-run dialogs with settings keys taken
+- Scripted live tests: pass in CI on hc 0.1.20 (Python 3.11-3.13, GitHub's ubuntu-latest). Three rounds of
+  fixes, all in the test bot or test, none in hco: the bot exited before hc counted it ready; with
+  `ready: quiet` a bot that prints nothing never "settles" (it now reports OSC 7501 idle/working, see
+  hc-facts); and the team test mailed a worker before hco had registered it as a member. That last one is
+  real behavior: mail to a worker spawned later is refused until its spawn finishes.
+- Not run anywhere yet: the real-Claude tests (no `ANTHROPIC_API_KEY` secret in the repository). Installing hc
+  in the session that wrote these was refused by its permission checks, so CI is where they run. The `agents` job pre-answers Claude Code's first-run dialogs with settings keys taken
   from memory, not checked (`hasCompletedOnboarding`, `customApiKeyResponses`,
   `bypassPermissionsModeAccepted`, `skipDangerousModePermissionPrompt`); a wrong one shows up as a worker
   stuck on a dialog, with its screen in the failure.
