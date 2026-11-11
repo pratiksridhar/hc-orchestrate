@@ -124,7 +124,8 @@ class Setup(TeamBase):
         safe = json.loads(self.spawn(run, "safe", "--permissions", "safe").stdout)
         self.assertNotIn("Your team", Path(safe["brief"]).read_text())
         self.assertTrue(any("not a team member" in x for x in safe["warnings"]))
-        far = json.loads(self.spawn(run, "far", "--on", "box", "--cwd", "/srv/app").stdout)
+        far_dir = Path(self.tmp.name) / "far"  # fake hc writes "remote" files locally: keep them in the temp dir
+        far = json.loads(self.spawn(run, "far", "--on", "box", "--cwd", str(far_dir)).stdout)
         self.assertTrue(any("not a team member" in x for x in far["warnings"]))
         self.assertEqual(sorted(self.docs()[f"sk-{run}-team"]["value"]["members"]), ["api", "lead"])
         self.assertEqual(self.spawn(run, "lead", check=False).returncode, 1)  # reserved as a mail address
