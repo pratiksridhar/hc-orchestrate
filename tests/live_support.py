@@ -94,7 +94,15 @@ class LiveHc(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", str(HCO), *args], cwd=self.repo, capture_output=True, text=True,
                            env={**self.env, "HC_TERMINAL_ID": self.lead, **(env or {})}, timeout=timeout)
         if check and p.returncode != 0:
-            self.fail(f"hco {args} exited {p.returncode}\n{p.stdout}\n{p.stderr}")
+            screen = ""
+            try:  # a failed spawn: show what is on the worker's screen
+                addr = json.loads(p.stdout).get("address")
+                if addr:
+                    time.sleep(1)
+                    screen = f"\n--- screen of {addr} ---\n{self.screen(addr)}"
+            except ValueError:
+                pass
+            self.fail(f"hco {args} exited {p.returncode}\n{p.stdout}\n{p.stderr}{screen}")
         return p
 
     def init(self, *extra):
@@ -126,6 +134,11 @@ class LiveHc(unittest.TestCase):
             rows = self.status(run)
             pending = [n for n in names if rows.get(n, {}).get("outbox", "-") == "-"]
             if not pending:
+                crashed = [n for n in names if "worker_bot crashed" in rows[n]["outbox"]]
+                if crashed:
+                    w = self.run_json(run)["workers"][crashed[0]]
+                    self.fail(f"{crashed[0]}: {rows[crashed[0]]['outbox']}\n"
+                              + Path(w["outbox"], "RESULT.md").read_text(errors="replace"))
                 return rows
             if time.time() > deadline:
                 screens = "\n".join(f"--- {n} ({rows.get(n, {}).get('state')}) ---\n{self.screen(rows[n]['address'])}"

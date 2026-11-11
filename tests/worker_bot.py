@@ -14,7 +14,8 @@ own labels (`hc get $HC_TERMINAL_ID`), reads its BRIEF.md and acts on one line i
   status     the STATUS line to report (default DONE)
 
 Then it writes RESULT.md (what it did, its inbox, every command's output), STATUS, and reports to its
-lead with `hc send`, exactly as a brief tells an agent to, and exits.
+lead with `hc send`, exactly as a brief tells an agent to, and stays open like an idle agent. If it
+crashes, STATUS says `FAILED: worker_bot crashed: <error>` and RESULT.md holds the traceback.
 """
 import json
 import os
@@ -89,5 +90,27 @@ def main():
     sh("hc", "send", lead, f"[hco {run}/{name}] {status} - {outbox}/RESULT.md")
 
 
+def stay():
+    """Stay open after reporting, as an agent does: hc counts a program that exits before it is ready as
+    a failed launch (first_message.sent false), and the lead may still send follow-ups. Killed by cleanup."""
+    while True:
+        time.sleep(3600)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:  # report the crash where the lead and the tests look, then stay open
+        import traceback
+        err = traceback.format_exc()
+        print(err, flush=True)
+        try:
+            rec = json.loads(subprocess.run(["hc", "get", os.environ.get("HC_TERMINAL_ID", ""), "--json"],
+                                            capture_output=True, text=True, timeout=60).stdout)
+            labels = rec.get("labels") or {}
+            out = Path(rec.get("cwd") or os.getcwd()) / ".hc-orchestrate" / labels["hco.run"] / "out" / labels["hco.worker"]
+            (out / "RESULT.md").write_text("# worker_bot crashed\n\n```\n" + err + "\n" + "\n".join(log) + "\n```\n")
+            (out / "STATUS").write_text("FAILED: worker_bot crashed: " + err.strip().splitlines()[-1] + "\n")
+        except Exception as e:
+            print(f"could not write the outbox either: {e}", flush=True)
+    stay()
