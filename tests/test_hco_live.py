@@ -69,9 +69,12 @@ class TeamLive(LiveHc):
         self.hco("task", "add", "--run", run, "--title", "first")
         self.hco("task", "add", "--run", run, "--title", "second")
         self.hco("task", "add", "--run", run, "--title", "third", "--after", "1")
-        a = self.spawn(run, "a", {"claim": True, "mail": [["b", "a says hello"]]})
+        # b first: a starts working at once, and mail to a worker that is not a member yet is refused.
         b = self.spawn(run, "b", {"claim": True, "wait_mail": 1})
+        a = self.spawn(run, "a", {"claim": True, "mail": [["b", "a says hello"]]})
         rows = self.wait_reported(run, ["a", "b"], timeout=120)
+        results = "\n".join(f"--- {n} RESULT.md ---\n" + Path(self.run_json(run)["workers"][n]["outbox"], "RESULT.md")
+                            .read_text(errors="replace") for n in ("a", "b"))
         self.assertEqual((rows["a"]["outbox"], rows["b"]["outbox"]), ("DONE", "DONE"))
 
         tasks = json.loads(self.hco("tasks", "--run", run, "--json").stdout)
@@ -81,7 +84,7 @@ class TeamLive(LiveHc):
         self.assertEqual(done_files, ["task-1.txt", "task-2.txt", "task-3.txt"])  # shared checkout: both wrote here
 
         mail = json.loads(self.hco("mail", "--run", run, "--json").stdout)
-        self.assertEqual([(m["from"], m["to"], m["text"]) for m in mail], [("a", "b", "a says hello")])
+        self.assertEqual([(m["from"], m["to"], m["text"]) for m in mail], [("a", "b", "a says hello")], results)
         self.assertEqual(mail[0]["term"], a["address"])  # the real $HC_TERMINAL_ID of a's terminal
         self.assertIsNone(mail[0]["flag"])
         result_b = Path(self.run_json(run)["workers"]["b"]["outbox"], "RESULT.md").read_text()
