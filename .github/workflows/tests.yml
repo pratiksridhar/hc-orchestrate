@@ -3,12 +3,20 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  # herdr-core release the live tests run against. To move to a newer one, take the version and the
+  # linux-x86_64 sha256 from https://releases.herdr.dev/core/latest.json.
+  HC_VERSION: "0.1.20"
+  HC_SHA256: "ac6b86890c451a37584620aaa438b71bc0d0bd430a2e7c1d7e095f052c414e74"
+
 jobs:
   unit:
+    # Every test, with a real hc: the *_live.py tests run against it (scripted workers, no LLM calls).
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -19,5 +27,72 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      # Standard library only. The *_live.py tests need a real hc and skip without one.
+      - name: Install hc (pinned, checksum checked)
+        run: |
+          set -eu
+          curl -fsSL "https://releases.herdr.dev/core/$HC_VERSION/herdr-core-linux-x86_64.tar.gz" -o /tmp/hc.tar.gz
+          echo "$HC_SHA256  /tmp/hc.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/hc.tar.gz -C "$HOME/.local/bin" herdr-core
+          ln -sf herdr-core "$HOME/.local/bin/hc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/hc" --version
       - run: python3 -I -m unittest discover -s tests -v
+
+  agents:
+    # Real Claude Code sessions as workers (tests/test_hco_agents_live.py). Costs tokens, so it runs on
+    # pushes and by hand only (not again for the pull request of the same commit), and only when the
+    # repository has an ANTHROPIC_API_KEY secret; without one every step is skipped.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      HCO_LIVE_AGENTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        if: env.ANTHROPIC_API_KEY != ''
+      - uses: actions/setup-python@v5
+        if: env.ANTHROPIC_API_KEY != ''
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        if: env.ANTHROPIC_API_KEY != ''
+        with:
+          node-version: "22"
+      - name: Install hc (pinned, checksum checked) and Claude Code
+        if: env.ANTHROPIC_API_KEY != ''
+        run: |
+          set -eu
+          curl -fsSL "https://releases.herdr.dev/core/$HC_VERSION/herdr-core-linux-x86_64.tar.gz" -o /tmp/hc.tar.gz
+          echo "$HC_SHA256  /tmp/hc.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/hc.tar.gz -C "$HOME/.local/bin" herdr-core
+          ln -sf herdr-core "$HOME/.local/bin/hc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+      - name: Pre-answer Claude Code's first-run dialogs
+        # Workers are interactive sessions in hc terminals; a first-run dialog would stop them. These are
+        # the settings Claude Code stores when a person answers them (onboarding done, this API key
+        # approved, the bypass-permissions warning accepted). If a new dialog appears, the test fails
+        # with the worker's screen in its output.
+        if: env.ANTHROPIC_API_KEY != ''
+        run: |
+          python3 - <<'EOF'
+          import json, os, pathlib
+          key = os.environ["ANTHROPIC_API_KEY"]
+          p = pathlib.Path.home() / ".claude.json"
+          p.write_text(json.dumps({"hasCompletedOnboarding": True,
+                                   "customApiKeyResponses": {"approved": [key[-20:]], "rejected": []},
+                                   "bypassPermissionsModeAccepted": True}))
+          s = pathlib.Path.home() / ".claude" / "settings.json"
+          s.parent.mkdir(parents=True, exist_ok=True)
+          s.write_text(json.dumps({"skipDangerousModePermissionPrompt": True}))
+          EOF
+      - name: Live tests with real Claude workers
+        if: env.ANTHROPIC_API_KEY != ''
+        run: python3 -I -m unittest discover -s tests -p "test_hco_agents_live.py" -v
+      - name: No ANTHROPIC_API_KEY secret
+        if: env.ANTHROPIC_API_KEY == ''
+        run: echo "Skipped the real-Claude tests. Add an ANTHROPIC_API_KEY repository secret to run them."

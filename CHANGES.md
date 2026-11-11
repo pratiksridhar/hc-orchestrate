@@ -3,6 +3,25 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Live tests on a real hc, with scripted and real Claude workers — written, NOT yet run
+
+- `tests/live_support.py`: an isolated real core per test class, a git repo and a `lead` terminal per test;
+  hco runs as that lead, so workers are its real hc children.
+- `tests/test_hco_live.py` (real hc, `tests/worker_bot.py` as the worker through an hc template, no LLM):
+  spawn into a worktree -> check -> accept -> merge -> cleanup; a stray file blocking the merge; two team
+  members working a task list with a dependency and mailing each other; acting under another member's name.
+- `tests/test_hco_agents_live.py` (`HCO_LIVE_AGENTS=1`, real Claude Code): one worker from spawn to merge;
+  two team members in separate worktrees passing a word through the mailbox.
+- CI: every job installs hc 0.1.20 (checksum pinned in the workflow), so the live tests run there. A new
+  `agents` job runs the real-Claude tests on pushes and by hand when the `ANTHROPIC_API_KEY` secret exists.
+- Not run yet: installing hc in the session that wrote these was refused by its permission checks, so their
+  first run is CI's. The `agents` job pre-answers Claude Code's first-run dialogs with settings keys taken
+  from memory, not checked (`hasCompletedOnboarding`, `customApiKeyResponses`,
+  `bypassPermissionsModeAccepted`, `skipDangerousModePermissionPrompt`); a wrong one shows up as a worker
+  stuck on a dialog, with its screen in the failure.
+- `CLAUDE.md` records the rule: changes are tested against a real hc, and with real Claude workers when they
+  change what a worker does.
+
 ## Team mode: shared task list and mail — fake-core tests only, NOT live-tested
 
 Opt-in with `hco init --team`; a run without it behaves exactly as before and never touches the doc store.

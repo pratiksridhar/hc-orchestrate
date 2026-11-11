@@ -376,7 +376,12 @@ hc run --bg --name lead --cwd "$PWD" codex --no-daemon && hc attach lead
 /hc-orchestrate add rate limiting to the public API, with tests and a review
 ```
 
-Tests: `python3 -I -m unittest discover -s tests` (the `*_live.py` ones skip without `hc`).
+Tests: `python3 -I -m unittest discover -s tests`. With `hc` on PATH this includes the live tests
+(`*_live.py`): each starts its own isolated hc session, and `tests/test_hco_live.py` runs hco and team
+mode end to end with scripted workers (`tests/worker_bot.py`, started through a real hc template).
+`HCO_LIVE_AGENTS=1` adds `tests/test_hco_agents_live.py`, with real Claude Code sessions as workers
+(needs `claude` logged in or `ANTHROPIC_API_KEY`; costs tokens). CI installs a pinned hc for every run
+and runs the real-Claude tests on pushes when the repository has an `ANTHROPIC_API_KEY` secret.
 
 ### Smoke test (cheap, 2 minutes)
 
