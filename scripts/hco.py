@@ -105,31 +105,51 @@ def _write_atomic(path, text):
         raise
 
 
+@contextlib.contextmanager
+def config_lock(path: Path):
+    """One hco at a time edits an agent config file: parallel `spawn --trust` calls each read, change and
+    replace the whole file, so without this the last writer drops the others' trust flags."""
+    try:
+        import fcntl
+    except ImportError:  # Windows: no advisory locks; behaves as before
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(f"{path}.hco-lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def trust_folder(agent, cwd):
     """Pre-accept the agent's folder-trust prompt for cwd (this machine only). Returns a note for the
     spawn output. Claude: ~/.claude.json projects[cwd].hasTrustDialogAccepted. Codex: ~/.codex/config.toml
     [projects."cwd"] trust_level = "trusted". Existing entries are kept; only a missing trust flag is added."""
     if agent == "claude":
         path = Path(os.environ.get("HCO_CLAUDE_JSON") or Path.home() / ".claude.json")
-        data = json.loads(path.read_text()) if path.exists() else {}
-        proj = data.setdefault("projects", {}).setdefault(cwd, {})
-        if proj.get("hasTrustDialogAccepted") is True:
-            return f"claude: {cwd} already trusted"
-        proj["hasTrustDialogAccepted"] = True
-        _write_atomic(path, json.dumps(data, indent=2) + "\n")
+        with config_lock(path):
+            data = json.loads(path.read_text()) if path.exists() else {}
+            proj = data.setdefault("projects", {}).setdefault(cwd, {})
+            if proj.get("hasTrustDialogAccepted") is True:
+                return f"claude: {cwd} already trusted"
+            proj["hasTrustDialogAccepted"] = True
+            _write_atomic(path, json.dumps(data, indent=2) + "\n")
         return f"claude: trusted {cwd} in {path}"
     if agent == "codex":
         import tomllib  # Python 3.11+; only needed here
         path = Path(os.environ.get("HCO_CODEX_CONFIG") or Path.home() / ".codex" / "config.toml")
-        text = path.read_text() if path.exists() else ""
-        cur = tomllib.loads(text).get("projects", {}).get(cwd)
-        if cur is not None:
-            if cur.get("trust_level") == "trusted":
-                return f"codex: {cwd} already trusted"
-            return f"codex: {cwd} has trust_level={cur.get('trust_level')!r} in {path}; left unchanged (edit it by hand)"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _write_atomic(path, text + ("" if text.endswith("\n") or not text else "\n")
-                      + f'\n[projects.{json.dumps(cwd)}]\ntrust_level = "trusted"\n')
+        with config_lock(path):
+            text = path.read_text() if path.exists() else ""
+            cur = tomllib.loads(text).get("projects", {}).get(cwd)
+            if cur is not None:
+                if cur.get("trust_level") == "trusted":
+                    return f"codex: {cwd} already trusted"
+                return f"codex: {cwd} has trust_level={cur.get('trust_level')!r} in {path}; left unchanged (edit it by hand)"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write_atomic(path, text + ("" if text.endswith("\n") or not text else "\n")
+                          + f'\n[projects.{json.dumps(cwd)}]\ntrust_level = "trusted"\n')
         return f"codex: trusted {cwd} in {path}"
     return f"{agent}: --trust only knows claude and codex; nothing changed"
 
@@ -340,8 +360,12 @@ def load_team(rundir: Path, data, s=None):
     if data["team"].get("closed"):
         try:
             arch = json.loads(team_archive(rundir).read_text())
-        except (OSError, ValueError):
-            arch = {}
+        except (OSError, ValueError) as e:  # say so: an empty list would claim there were no tasks or mail
+            _, hcdoc = team_mod()
+            err = hcdoc.Fail(f"the team was closed by cleanup and its archive {team_archive(rundir)} can't be "
+                             f"read ({getattr(e, 'strerror', None) or e}): its tasks and mail are not known")
+            err.code = 1
+            raise err
         return arch.get("tasks") or [], arch.get("mail") or []
     hcteam, _ = team_mod()
     hcteam.get_team(s, data["run"])
@@ -995,6 +1019,12 @@ def tree_hash(cwd):
         return p.stdout.strip() if p.returncode == 0 else None
 
 
+def check_clash(name, others):
+    """The worker in `others` whose terminal name would equal the check terminal of `name` or the other way
+    round (`<run>-c-<name>` is the check of `name` and the terminal of a worker `c-<name>`), or None."""
+    return next((o for o in others if o != name and (name == f"c-{o}" or o == f"c-{name}")), None)
+
+
 SPAWN_DEFAULTS = dict(role="implement", cwd=None, scope=None, worktree=False, base="HEAD", on=None,
                       permissions="bypass", no_scrub=False, model=None, direct=False, outlive=False, trust=False,
                       check=None, deadline=None, max_rounds=MAX_ROUNDS, after=None)
@@ -1022,7 +1052,10 @@ def spawn_worker(a, task=None):
     if a.trust and a.on:
         die("--trust edits this machine's agent config; it can't be used with --on")
     if task is None:
-        task = Path(a.brief).read_text()
+        try:
+            task = Path(a.brief).read_text()
+        except OSError as e:
+            die(f"can't read --brief {a.brief}: {e.strerror or e}", 2)
     if not task.strip():
         die(f"brief file {a.brief} is empty")
     scope = normalize_scope(a.scope)
@@ -1044,6 +1077,10 @@ def spawn_worker(a, task=None):
     def reserve(d):
         if a.name in d["workers"]:
             die(f"worker '{a.name}' already exists in run {run}; pick another name")
+        clash = check_clash(a.name, [*d["workers"], *d.get("starting", {})])
+        if clash:
+            die(f"worker name '{a.name}' clashes with worker '{clash}': the check terminal of one would have the "
+                f"same name as the other's terminal ({run}-c-...); pick another name")
         starting = d.setdefault("starting", {})
         if time.time() - starting.get(a.name, 0) < STARTING_TTL:
             die(f"another spawn of '{a.name}' is in progress in run {run}; wait for it or pick another name")
@@ -1168,7 +1205,7 @@ def _spawn_reserved(a, rundir, data, task, scope, check, lead, term, branch, wt,
     if a.outlive:
         cmd.append("--outlive-parent")
     try:
-        res = hc_json(cmd + ["--", *argv], timeout=180)
+        res = hc_json(cmd + ["--", *argv], timeout=100)  # below Claude Code's 120 s Bash limit
     except HcError as e:
         die(f"spawn failed: {e}" + (f" (worktree {cwd} and branch {branch} were removed again)" if branch else ""))
     except subprocess.TimeoutExpired:
@@ -1176,8 +1213,8 @@ def _spawn_reserved(a, rundir, data, task, scope, check, lead, term, branch, wt,
         try:
             res = hc_json(["get", f"{a.on}/{term}" if a.on else term, "--json"], timeout=30)
         except (HcError, subprocess.TimeoutExpired):
-            die(f"spawn failed: hc run gave no answer in 180 s and no terminal {term} exists")
-        warnings.append(f"hc run gave no answer in 180 s, but terminal {term} exists: hc read {term} --lines 40 "
+            die(f"spawn failed: hc run gave no answer in 100 s and no terminal {term} exists")
+        warnings.append(f"hc run gave no answer in 100 s, but terminal {term} exists: hc read {term} --lines 40 "
                         "to see whether the task went in")
 
     made["terminal"] = True
@@ -1594,12 +1631,45 @@ def read_task_file(path):
         extra = set(e) - {"title", "detail", "for", "after", "key"}
         if extra:
             die(f"--file {path}: entry {i} has unknown keys {sorted(extra)}", 2)
+        for k in ("detail", "for", "key"):
+            if e.get(k) is not None and not isinstance(e[k], str):
+                die(f"--file {path}: entry {i}: \"{k}\" must be a string", 2)
+        after = e.get("after")
+        if after is not None and not (isinstance(after, list) and all(
+                isinstance(d, str) or (isinstance(d, int) and not isinstance(d, bool)) for d in after)):
+            die(f"--file {path}: entry {i}: \"after\" must be a list of task numbers and keys of earlier entries", 2)
         for d in e.get("after") or []:
             if isinstance(d, str) and d not in keys:
                 die(f"--file {path}: entry {i} is after \"{d}\", which is not the key of an earlier entry", 2)
         if e.get("key") is not None:
             keys.add(e["key"])
     return entries
+
+
+def check_task_entries(s, run, path, entries):
+    """What hcteam.add_task would refuse, checked for every --file entry before the first one is added:
+    a bad entry must not leave the ones before it on the list (fixing the file and rerunning would add
+    those twice). Dies with exit 2 and the entry's number."""
+    hcteam, hcdoc = team_mod()
+    members = hcteam.get_team(s, run)["members"]
+    existing, last = hcteam.scan(s, run, "t", hcteam.MAX_TASKS)
+    have = {n for n, _, _ in existing}
+    for i, e in enumerate(entries, 1):
+        try:
+            hcteam.one_line(e["title"], hcteam.MAX_TITLE, "the task's title")
+            hcteam.block(e.get("detail"), hcteam.MAX_DETAIL, "the task's detail")
+        except hcdoc.BadInput as err:
+            die(f"--file {path}: entry {i}: {err}", 2)
+        who = e.get("for")
+        if who is not None and (who == hcteam.LEAD or who not in members):
+            die(f"--file {path}: entry {i}: \"for\": {who} is not a member of this team (members: "
+                f"{', '.join(sorted(n for n in members if n != hcteam.LEAD)) or 'none yet'})", 2)
+        for d in e.get("after") or []:
+            if isinstance(d, int) and d not in have:
+                die(f"--file {path}: entry {i} is after #{d}, but there is no task #{d}", 2)
+        if last + i > hcteam.MAX_TASKS:
+            die(f"--file {path}: entry {i} does not fit: the task list holds at most {hcteam.MAX_TASKS} tasks "
+                f"and {last} are used; nothing was added", 2)
 
 
 def cmd_task(a):
@@ -1615,6 +1685,7 @@ def cmd_task(a):
                     die("task add needs --title (one task) or --file (a JSON list), not both", 2)
                 if a.file:
                     entries = read_task_file(a.file)
+                    check_task_entries(s, run, a.file, entries)
                 else:
                     detail = Path(a.detail_file).read_text() if a.detail_file else a.detail
                     entries = [{"title": a.title, "detail": detail, "for": a.assignee, "after": a.after}]
@@ -1640,10 +1711,9 @@ def cmd_task(a):
         die(f"team: {e}", 3)
     except hcdoc.Fail as e:
         die(f"team: {e}", e.code)
-    if a.action != "cancel":
-        told = hcteam.nudge_tasks(run, members, tasks)
-        if told:
-            print(f"told {', '.join(told)} that a task is open (only those that are idle get the message)")
+    told = hcteam.nudge_tasks(run, members, tasks)  # after cancel too: tasks that waited for it may be open now
+    if told:
+        print(f"told {', '.join(told)} that a task is open (only those that are idle get the message)")
     if len(members) < 2:
         print("no worker is on the team yet: spawn them, they claim when they start")
     return 0
@@ -1734,8 +1804,13 @@ def cmd_scope(a):
             die(f"{a.name} is a {w['role']} worker; it may change no files")
         have = w.get("scope") or []
         add = [p for p in normalize_scope(a.add) if p not in have]
-        w["scope"] = have + add
-        update_run(rundir, lambda d: d["workers"][a.name].update(scope=have + add))
+
+        def widen(d):  # into the scope as it is now: another `scope --add` may have run since load_run
+            x = d["workers"][a.name]
+            x["scope"] = (x.get("scope") or []) + [p for p in add if p not in (x.get("scope") or [])]
+            w["scope"] = x["scope"]
+
+        update_run(rundir, widen)
         if add:
             journal(rundir, "scope_add", worker=a.name, added=add)
             pats = ", ".join(add)
@@ -1767,18 +1842,25 @@ def cmd_merge(a):
     trees = {n: tree_hash(w["worktree"]) for n, w in pending if w.get("check") or w.get("accepted")}
     gates = {}
     for n, w in pending:
-        if n not in trees:
-            continue
-        chk, acc = check_state(w, trees[n]), accepted_state(w, trees[n])
         why = []
-        if chk in ("missing", "running"):
-            why.append(f"its check has not run (hco check --run {data['run']} --name {n})")
-        elif chk == "failed":
-            why.append(f"its check failed (exit {w['check_result'].get('exit')})")
-        elif chk == "stale":
-            why.append("files changed after its check passed: run the check again")
-        if acc == "stale":
-            why.append("files changed after you accepted it: verify and accept again")
+        if n in trees:
+            chk, acc = check_state(w, trees[n]), accepted_state(w, trees[n])
+            if chk in ("missing", "running"):
+                why.append(f"its check has not run (hco check --run {data['run']} --name {n})")
+            elif chk == "failed":
+                why.append(f"its check failed (exit {w['check_result'].get('exit')})")
+            elif chk == "stale":
+                why.append("files changed after its check passed: run the check again")
+            if acc == "stale":
+                why.append("files changed after you accepted it: verify and accept again")
+        if w.get("round", 1) > 1:  # `send` dropped the accept: this round's work is not verified yet
+            st = first_line(read_outbox_file(w, "STATUS") or "")
+            if not st.startswith("DONE"):
+                why.append(f"it is in follow-up round {w['round']} and has not reported DONE for it "
+                           f"(STATUS: {st or 'none'})")
+            if not w.get("accepted") and not (n in trees and chk == "passed"):  # a passed check verifies it
+                why.append(f"you have not accepted it since its follow-up round {w['round']} "
+                           f"(hco accept --run {data['run']} --name {n})")
         if why:
             gates[n] = why
     if a.dry_run:
@@ -1846,6 +1928,12 @@ def cmd_merge(a):
         if p.returncode != 0:
             conflicts = git(["diff", "--name-only", "--diff-filter=U"], root, check=False).stdout.split()
             git(["merge", "--abort"], root, check=False)
+            if not conflicts:  # git refused before merging, e.g. an untracked file in the root would be overwritten
+                reason = (p.stderr.strip() or p.stdout.strip() or f"git merge exited {p.returncode}")
+                print(f"MERGE FAILED {name} into {target} (not a conflict): {reason}")
+                print("nothing was merged. Fix the cause git names above, then merge again.")
+                journal(rundir, "merge_failed", worker=name, into=target, error=reason)
+                return 1
             print(f"CONFLICT merging {name} into {target}: {', '.join(conflicts) or p.stdout.strip()}")
             print("merge aborted; the root is clean. Resolve it yourself or ask the user.")
             journal(rundir, "merge_conflict", worker=name, into=target, files=conflicts)
@@ -1970,8 +2058,9 @@ def cmd_check(a):
         if pend:
             print(f"check: the earlier check terminal {pend.get('terminal')} is gone; starting again")
         log = rundir / "checks" / f"{a.name}.log"
+        # Not emptied here: the check's own `> log` does that once its terminal started, so a second
+        # `hco check` that loses the race for the terminal name can't wipe the running check's log.
         log.parent.mkdir(exist_ok=True)
-        log.write_text("")
         term = f"{run}-c-{a.name}"
         if len(term) > 32:
             import hashlib
@@ -2057,6 +2146,8 @@ def cmd_accept(a):
     bad = out_of_scope(files or [], w.get("scope"))
     if bad:
         problems.append(f"files outside its scope: {', '.join(bad)}")
+    elif files is None and w.get("scope"):
+        problems.append(f"its changed files can't be listed, so its scope ({', '.join(w['scope'])}) was not checked")
     if data.get("team") and not data["team"].get("closed"):
         hcteam, hcdoc = team_mod()
         try:
@@ -2090,7 +2181,10 @@ def cmd_send(a):
     stale DONE while it works), and rounds are counted against the worker's limit."""
     rundir, data = load_run(a.run)
     run, w = data["run"], get_worker(data, a.name)
-    body = Path(a.file).read_text() if a.file else (a.text or "")
+    try:
+        body = Path(a.file).read_text() if a.file else (a.text or "")
+    except OSError as e:
+        die(f"can't read --file {a.file}: {e.strerror or e}", 2)
     if not body.strip():
         die("nothing to send: pass --text '...' or --file <path>")
     rnd, limit = w.get("round", 1), w.get("max_rounds", MAX_ROUNDS)
@@ -2312,6 +2406,8 @@ def validate_plan(plan, base_dir: Path, data, allow_overlap=False):
             errors.append(f"{n}: brief file {e.get('brief')!r} is missing or empty (paths are relative to the plan file)")
         else:
             e["brief"] = str(brief.resolve())
+        if isinstance(e.get("cwd"), str) and e["cwd"] and not e["cwd"].startswith("@") and not e.get("on"):
+            e["cwd"] = str((base_dir / e["cwd"]).resolve())  # like brief: relative to the plan file
         if e.get("scope"):
             if e["role"] in READ_ONLY_ROLES:
                 errors.append(f"{n}: a {e['role']} worker may change no files, so it takes no scope")
@@ -2327,6 +2423,11 @@ def validate_plan(plan, base_dir: Path, data, allow_overlap=False):
             errors.append(f"{n}: give either worktree or cwd, not both")
         entries[n] = e
     known = set(entries) | set(data["workers"])
+    for n in entries:
+        clash = check_clash(n, known)
+        if clash and (n == f"c-{clash}" or clash not in entries):  # each clashing pair once
+            errors.append(f"{n}: clashes with worker '{clash}': the check terminal of one would have the same "
+                          f"name as the other's terminal; rename one")
     for n, e in entries.items():
         deps = {}
         for dep in e.get("after") or []:
@@ -2450,7 +2551,9 @@ def dep_unmet(data, dep, statuses):
     run, w = data["run"], data["workers"].get(name)
     if w is None:
         return f"{name} has not started"
-    status = statuses[name]
+    status = statuses.get(name)
+    if status is None:  # spawned (by another hco) after the caller read the statuses
+        status = first_line(read_outbox_file(w, "STATUS") or "")
     if status.startswith(("FAILED", "BLOCKED")):
         return f"{name} reported {status}"
     if level == "merged":
@@ -2588,8 +2691,11 @@ def cmd_report(a):
     for name, w in data["workers"].items():
         status = first_line(read_outbox_file(w, "STATUS") or "") or "(none)"
         r = w.get("check_result")
-        chk = "-" if not w.get("check") else "not run" if not r else \
-            f"passed ({r['seconds']} s)" if r.get("passed") else f"FAILED (exit {r.get('exit')})"
+        # the files as they are now (check_state); a folder that is gone (cleanup) or remote can't have moved
+        st = check_state(w, None if not w.get("on") and Path(w["cwd"]).is_dir() else (r or {}).get("tree"))
+        chk = "-" if st == "none" else "not run" if st == "missing" else "running" if st == "running" else \
+            f"FAILED (exit {r.get('exit')})" if st == "failed" else \
+            f"passed ({r['seconds']} s)" + (", then files changed" if st == "stale" else "")
         acc = w.get("accepted")
         acc_s = "-" if not acc else "yes" + (" (forced)" if acc.get("forced") else "") + (f": {acc['note']}" if acc.get("note") else "")
         m = w.get("merged")
