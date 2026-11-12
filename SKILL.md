@@ -72,6 +72,10 @@ and dependencies.
 - Pick a recipe from `references/patterns.md`.
 - A batch of many independent, deterministic jobs (a case × variant grid running one fixed command, no
   agent judgment) is a **board** run: propose it as one row in the plan table (see Board mode).
+- Work that is many small units rather than one job per worker, or workers that must tell each
+  other things (an interface one of them owns, a shared test setup), is a **team** run:
+  `hco init --team` gives them a shared task list and mail (see Team mode). Say so in the plan.
+  Leave it off for one worker, a pipeline, or parts that are strictly separate.
 
 Show the user the plan as a short table and ask to proceed, unless the task
 text already says to go ahead.
@@ -109,7 +113,7 @@ hco spawn --run <run> --name api --agent claude --role implement --worktree \
 With a stored plan, `hco advance --run <run>` replaces the `spawn` calls: it starts every
 worker whose `after` holds (up to `max_parallel`), adds the earlier workers' RESULT.md
 paths to its brief, and prints what still waits and why. Run it again after each
-`accept` or `merge`; `"complete": true` means every planned worker ran and was accepted.
+`accept` or `merge`; `"complete": true` means every planned worker ran and was accepted or merged.
 
 `spawn` wraps the body in the worker contract (scope, no sub-agents, report
 protocol, policy). Give every writer `--scope`: patterns relative to the repo root
@@ -161,6 +165,11 @@ It writes the text to `FOLLOWUP.r<n>.md` in the outbox, moves the old STATUS and
 aside (`STATUS.r1`, `RESULT.r1.md`) so the table can't show a stale `DONE`, drops your
 earlier `accept`, and counts rounds: after 3 (the first task plus two follow-ups) it exits 4
 and you report to the user.
+
+Safe-mode caveat: a Claude worker in `--permissions safe` asks before it reads a file outside its
+own folder or runs a command (`blocked`, rule 3). A worktree worker can't read the run's other
+outboxes: copy what it needs (an upstream RESULT.md, review findings) into its own outbox and name
+that path, and tell it in the brief which commands it can't run.
 
 Reporting caveats: in `--permissions safe`, Codex's sandbox blocks `hc send`, so its
 reports reach you as STATUS/RESULT.md files plus hc's status events, not as messages
@@ -242,6 +251,47 @@ briefs and tells each live local worker where to report. Workers you did not sta
 your hc children, so `hco wait` then polls their state and STATUS files instead (same
 output). Continue from phase 3; with a plan, `hco advance` picks up where it stopped.
 
+## Team mode (optional: `hco init --task "<task>" --team`)
+
+Modelled on Claude Code's agent teams: you put units of work on a **task list**, the workers claim
+them one at a time, and every member can **mail** any other by name. Scope, checks, `accept` and
+`merge` stay per worker and work as above. Exit 4 from `init --team`: this hc has no doc store;
+run `init` without it.
+
+1. **Spawn the members.** Each worker's brief body says what it owns (role, `--scope`, what "done"
+   means for its part); the units of work go on the task list, not into the brief. Only local
+   workers in the default bypass mode become members. For `--on` or `--permissions safe`, `spawn`
+   warns: that worker needs its whole task in its brief.
+2. **Add tasks** (before or after spawning; idle members are told):
+   ```sh
+   hco task add --run <run> --title "rate limiter with tests" --detail "token bucket per API key"
+   hco task add --run <run> --title "wire it into the router" --after 1 --for api
+   hco task add --run <run> --file tasks.json   # [{"key","title","detail","for","after"}], after: keys or numbers
+   ```
+   A task is one self-contained unit with a clear result (a function, a test file, a review), about
+   5 per worker. `--after` makes it wait for other tasks. `--for` reserves it for one member: use it
+   whenever only one worker's scope covers the files. Unassigned tasks go to whoever claims first.
+   Writers have separate worktrees: a task that needs another worker's **code** can't see it until
+   you merged it, so order such work with a plan (`after: ["build:merged"]`), not with `--after`.
+3. **Supervise** with `hco wait` as usual. Under the table: `tasks: ...`, `mail: <n> new
+   message(s)`, and a note when a worker that reported `DONE` holds a task again (it was woken for
+   more work; wait for its next report). `hco tasks --run <run>` shows who holds what.
+   `hco mail --run <run>` shows **every** message, also those between two workers.
+4. **Steer through the list.** A completed task that is wrong:
+   `hco task reopen --run <run> --id <n> --why "<the concrete error>"` (it goes back to whoever did
+   it). Also `hco task assign --id <n> --for <name>` and `hco task cancel --id <n>`. Answer or
+   correct by mail: `hco mail --run <run> --to <name|all> "<text>"`. A change of a worker's task,
+   scope or rules still goes through `hco send` or `hco scope --add`, never by mail.
+5. **Verify as always.** `completed` and every message are claims nobody checked, and mail reached
+   other workers without passing you. `hco collect` lists tasks and mail after the workers; when a
+   RESULT.md says it relied on a message, check that message too. `!! message #n ...` means the
+   author can't be right: disregard it and look at that terminal. `hco accept` refuses a worker
+   that still holds a task.
+6. `hco cleanup` writes tasks and mail to `.hc-orchestrate/<run>/team.json` and deletes the docs.
+
+Limits: 100 tasks, 400 messages (40 per worker), 500 characters a message. No secrets: the store is
+unencrypted. Team size: 3 to 5 workers; more adds mail and merge work faster than it adds speed.
+
 ## Board mode (batch jobs on the doc store)
 
 For a grid of independent jobs that run a fixed command (not LLM agents): state lives in herdr-core's
@@ -274,7 +324,7 @@ plan table; start it only after the user approves.
 5. Verify as in phase 4: read `experiments/<exp>.json` and the job outputs under `runs/<exp>/`; a job doc
    is a claim, and failed jobs carry their error. Report failures to the user.
 6. Failed jobs, once their cause is fixed: `hcboard.py init <new-exp> --retry-failed <exp>` makes a child
-   experiment of only those jobs from the export (add `--spec` to change `job_cmd` or limits), then step 3.
+   experiment of only those jobs from the export (`--spec` replaces the parent's settings and must be a full spec: `cases`, `variants`, `job_cmd` and `question` are required, even though `cases` and `variants` are then replaced by the failed pairs), then step 3.
    Never rerun the whole grid for a few failures.
 
 Board terminals carry labels `exp=<exp>`, `role=worker`, `hco.board=<exp>`: touch only those. Details,

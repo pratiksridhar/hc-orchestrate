@@ -87,6 +87,7 @@ What the skill relies on:
 | Run state | `run.json` is written under a lock with a fresh read (parallel `spawn` calls are safe), a failed spawn rolls its worktree back, every action lands in a journal (`hco log`, `hco report`), and a restarted lead takes the run over with `hco runs` + `hco adopt`. |
 | Worker contract | Every brief carries scope rules, "no sub-agents", your policy, and a **two-channel report**: files in an outbox (`RESULT.md` + `STATUS`) and a one-line `hc send` prefixed `[hco <run>/<name>]`. |
 | Scope check | `spawn --scope 'src/auth/**'` records the files a writer may change and lists them in its brief; `collect` flags any other file it changed (renames and deletions included) and `merge` refuses to commit them. `hco scope --add` widens one worker's scope. |
+| Team mode | Optional (`hco init --team`), modelled on Claude Code's agent teams: a shared task list the workers claim from (dependencies, assignment, atomic claims) and mail between members, in herdr-core's doc store (`scripts/hcteam.py`). The lead sees every task change and every message. See [below](#team-mode-shared-task-list-and-mail). |
 | `scripts/hcboard.py`, `docstore_worker.py`, `hcdoc.py` | **Board mode** (stdlib Python): the orchestrator loop, the job-claiming worker and the guarded doc-store helper they share. See below. |
 | `templates/hco-claude.md`, `hco-codex.md` | hc templates so core waits for the agent to be ready before handing it the task, and tells the lead if it didn't go in. |
 | `references/` | Orchestration recipes, the verified hc facts the skill depends on, and the doc-store notes behind board mode. |
@@ -156,6 +157,73 @@ sequenceDiagram
     L->>O: hco collect: read RESULT.md, diff vs. scope
     Note over L: the report is a claim: verify before trusting it
 ```
+
+## Team mode: shared task list and mail
+
+Without it, each worker gets one brief and talks only to the lead. `hco init --task "..." --team`
+adds the two things [Claude Code's agent teams](https://code.claude.com/docs/en/agent-teams) are
+built on: a **task list** the workers claim from, and a **mailbox** per member.
+
+```mermaid
+flowchart LR
+    lead["<b>Lead</b>"] -->|"hco task add · assign<br/>reopen · cancel"| tasks
+    tasks[("<b>Task list</b><br/>sk-&lt;run&gt;-t001, …<br/>pending · in progress<br/>completed")]
+    w1["Worker api"] -->|"claim (CAS) · done<br/>release"| tasks
+    w2["Worker ui"] -->|"claim · done"| tasks
+    w1 <-->|"send --to ui<br/>inbox"| mailbox[("<b>Mail</b><br/>sk-&lt;run&gt;-m001, …")]
+    w2 <-->|"send --to api · all · lead"| mailbox
+    mailbox -->|"hco mail: every message"| lead
+    w1 -->|"RESULT.md + STATUS<br/>(unchanged)"| lead
+    w2 -->|"RESULT.md + STATUS"| lead
+```
+
+| Agent teams | Here |
+|---|---|
+| Tasks are pending, in progress or completed; a task can depend on others and is blocked until they are completed | Same, plus `cancelled`. `--after` names the tasks to wait for. |
+| The lead assigns, or teammates self-claim the next unassigned, unblocked task | Same: `--for <name>` assigns; `claim` takes the lowest-numbered task the member may take. One task at a time. |
+| Claiming uses file locking | A compare-and-set on the task's doc: of two claimers exactly one wins. |
+| A teammate messages one teammate by name; to reach everyone it sends one message each | `send --to <name>`, `--to lead`, and `--to all` as one stored message. |
+| Messages are delivered automatically | Stored first; the recipient is told only if it is idle (`hc send --if idle`). A working agent is not interrupted: every team command it runs says `mail: n unread`. |
+| The lead is told when a teammate goes idle | Unchanged from the normal flow: STATUS file, `hc send` report, hc status events. |
+| `TaskCompleted` hooks can reject a completion | `hco task reopen --id n --why "..."` sends it back. `completed` is a claim; `check`, `accept` and `merge` still gate each worker. |
+| "Two teammates editing the same file leads to overwrites": the docs advise that each owns a different set of files | Writers keep their worktrees and `--scope`. Assign tasks (`--for`) where only one worker's scope fits. |
+
+Where it deliberately differs:
+
+- **The lead reads all mail**, also between two workers (`hco mail`, `collect`, the journal). The
+  skill's rule is that a report is a claim to verify, and mail reaches workers without passing the
+  lead.
+- **Mail and task notes are marked as claims.** The brief tells members to check them against the
+  code, never to leave their scope because of one, and to name the messages they relied on.
+- **Authors are checked.** A member acts under its own name only (its terminal must be the one
+  `hco` started for that name), and the lead's views flag a message whose terminal doesn't fit.
+- **Only the lead adds tasks.** A worker that sees missing work writes to the lead.
+- **Bounded.** 100 tasks, 400 messages, 40 per worker, 500 characters each.
+
+```sh
+hco init --task "rate limiting for the public API" --team    # exit 4: this hc has no doc store
+hco spawn --run k3x9 --name api --agent claude --worktree --scope 'src/api/**' --brief api.md
+hco task add --run k3x9 --title "token bucket limiter with tests"
+hco task add --run k3x9 --title "wire it into the router" --after 1 --for api
+hco tasks --run k3x9                                          # who holds what, what waits
+hco mail  --run k3x9                                          # every message, flags included
+hco mail  --run k3x9 --to ui "the limiter returns 429 with Retry-After"
+hco task reopen --run k3x9 --id 1 --why "test_burst fails: <error>"
+# what a worker runs (the exact commands are in its brief):
+python3 $S/hcteam.py claim --run k3x9 --as api
+python3 $S/hcteam.py done  --run k3x9 --as api 1 --note "limiter.py; 6 tests pass"
+python3 $S/hcteam.py send  --run k3x9 --as api --to ui "getUser is now fetchUser(id, opts)"
+python3 $S/hcteam.py inbox --run k3x9 --as api
+```
+
+Who is a member: local workers in the default bypass mode. A worker on another machine (`--on`)
+has neither this core's doc store nor the script, and in `--permissions safe` the command would
+stop Claude at a permission prompt and Codex's sandbox blocks the core's socket; `spawn` warns for
+both, and such a worker needs its whole task in its brief.
+
+Task dependencies are about order, not about code: writers work in separate worktrees, so a task
+that needs another worker's code can't see it before the lead merged it. Order that with a plan
+(`after: ["build:merged"]`).
 
 ## Board mode: batch jobs on the doc store
 
@@ -282,7 +350,10 @@ terminals labeled `hco.board=<exp>`. Design, verified hc behavior and limits:
 ## Install
 
 Prerequisites: `hc` (`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`),
-Python 3.8+, git, and `claude` and/or `codex` logged in.
+Python 3, git, and `claude` and/or `codex` logged in. CI tests Python 3.11, 3.12 and 3.13; the
+scripts use only the standard library and no syntax newer than 3.8 was found, but older versions are
+untested. `--trust` for Codex edits a TOML file and needs `tomllib` (Python 3.11+); on older Python it
+only warns "--trust failed".
 
 ```sh
 sh install.sh            # copies the skill to ~/.claude/skills and ~/.agents/skills,
@@ -308,7 +379,12 @@ hc run --bg --name lead --cwd "$PWD" codex --no-daemon && hc attach lead
 /hc-orchestrate add rate limiting to the public API, with tests and a review
 ```
 
-Tests: `python3 -I -m unittest discover -s tests` (the `*_live.py` ones skip without `hc`).
+Tests: `python3 -I -m unittest discover -s tests`. With `hc` on PATH this includes the live tests
+(`*_live.py`): each starts its own isolated hc session, and `tests/test_hco_live.py` runs hco and team
+mode end to end with scripted workers (`tests/worker_bot.py`, started through a real hc template).
+`HCO_LIVE_AGENTS=1` adds `tests/test_hco_agents_live.py`, with real Claude Code sessions as workers
+(needs `claude` logged in or `ANTHROPIC_API_KEY`; costs tokens). CI installs a pinned hc for every run
+and runs the real-Claude tests on pushes when the repository has an `ANTHROPIC_API_KEY` secret.
 
 ### Smoke test (cheap, 2 minutes)
 
@@ -433,6 +509,7 @@ report that arrived between two waits is still returned as a change.
   plan/<worker>.md                     brief copies of a stored plan (hco plan)
   checks/<worker>.log                  output of the worker's last check
   REPORT.md                            written by hco report
+  team.json                            the team's tasks and mail, written by cleanup (init --team)
   wt/<worker>/                         git worktree, branch hco/<run>/<worker>
   workers/<worker>/BRIEF.md            copy of each brief; outboxes archived here on cleanup
 <worker cwd>/.hc-orchestrate/<run>/out/<worker>/
@@ -446,11 +523,18 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
 
 ## Known limits
 
-- Plans, checks, `accept`, `send`, `adopt`, the polling `wait` and the journal were built and
-  tested against the stand-in hc in `tests/fake_hc.py` only; no real hc was available where
-  they were written. They use `hc run --no-notify`, `hc wait <t>`, `hc get`, `hc rm` and
-  `hc send` as `references/hc-facts.md` describes them. Run the smoke test below once on your hc
-  before relying on them; see CHANGES.md for the exact assumptions.
+- Live-tested on hc 0.1.20 with scripted workers (`tests/test_hco_live.py`, `tests/worker_bot.py`, in
+  CI): team mode (`init --team`, `hco task|tasks|mail`, `hcteam.py`), `check`, `accept` and `merge`.
+  Not live-tested: plans and `advance`, `send` (including `hc send --if idle` as the team nudge),
+  `adopt`, the polling `wait` and the journal; they were tested against the stand-in hc in
+  `tests/fake_hc.py` only and use `hc run --no-notify`, `hc wait <t>`, `hc get`, `hc rm` and `hc send`
+  as `references/hc-facts.md` describes them. Run the smoke test above once on your hc before relying
+  on them; see CHANGES.md for the exact assumptions.
+- Team mode with real agents: only the scripted workers above ran against a real core. Not yet seen:
+  whether real agents follow the claim/done loop, mark tasks completed reliably or mail too much. The agent-teams
+  documentation lists "task status can lag" as a known problem there; expect it here too. Workers
+  can be misled by a wrong message before the lead corrects it, and the author check is advisory (a
+  bypassed worker can set its own `HC_TERMINAL_ID` or write docs directly).
 - `hco check` runs local checks only. For a worker on another machine run its check there and
   record the outcome with `hco accept --force --note`.
 - A deadline only flags a worker (`NEXT`, a note under the table). Nothing is interrupted or

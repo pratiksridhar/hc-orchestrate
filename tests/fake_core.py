@@ -12,7 +12,8 @@ a stale doc.set fails with data.kind "conflict"; a null write keeps counting ver
 background, with HC_TERMINAL_ID set; `kill` sends it SIGHUP like `hc kill` (signal 1).
 
 Knobs: FAKE_CORE_SLIM=1 makes `ls` return slim rows (no name, labels or exit_code), as references/hc-facts.md
-describes them. Every doc.get/doc.set is counted in ops.json ({"get": n, "set": n, "get:<name>": n}).
+describes them. While $FAKE_CORE_DIR/down exists, a new `connect` exits at once (a core that is not back yet).
+Every doc.get/doc.set is counted in ops.json ({"get": n, "set": n, "get:<name>": n}).
 """
 import fcntl
 import json
@@ -67,6 +68,8 @@ def count(*keys):
 
 
 def connect():
+    if os.path.exists(os.path.join(DIR, "down")):
+        sys.exit(1)  # the core is away: new connections fail, open ones keep working
     sub_at = None  # byte offset in events.jsonl from which this subscriber still has to read
     seq = 0
     buf = b""

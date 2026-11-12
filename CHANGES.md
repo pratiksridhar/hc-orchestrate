@@ -3,6 +3,149 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Review run `cl4u`: bugs found by four reviewers, fixed by four writers — unit tests + scripted live tests on hc 0.1.20; the new behavior itself mostly NOT live-tested
+
+Done with the skill itself on a real hc 0.1.20: a Claude Code lead, Claude Code workers on Opus 5.5 and
+Sonnet 5.5 in `--permissions safe`, four read-only reviewers, then four writers in worktrees with scopes
+and checks (`plan` + `advance`, `check`, `accept`, two follow-up rounds with `send`, `merge`). The lead read
+every finding against the code before planning and every diff before accepting.
+
+hco.py
+- `spawn --trust`: the read-change-replace of `~/.claude.json` / `~/.codex/config.toml` now holds a lock
+  (`<file>.hco-lock`); parallel spawns no longer drop each other's trust flag.
+- `merge`: a `git merge` that fails without a conflict (an untracked file in the root would be overwritten)
+  prints `MERGE FAILED ... (not a conflict): <git's reason>` instead of an empty `CONFLICT`.
+- `merge`: a worker in a follow-up round is `NOT VERIFIED` until it reported DONE for that round and either
+  its check passed on the current files or it was accepted again. Before, a worker without a check lost
+  every gate when `send` dropped its accept.
+- `accept`: refuses when a scoped worker's changed files can't be listed (the scope was not checked).
+- `scope --add`: merges into the scope as stored now; two calls at once no longer lose a pattern.
+- `check`: no longer empties the log before its terminal started (a second `check` wiped the running
+  one's log). `spawn`/`plan` refuse a worker name that equals another worker's check terminal (`c-<name>`).
+- `advance`: no KeyError for a worker another hco spawned meanwhile; a relative `cwd` in plan.json is
+  relative to the plan file, like `brief`.
+- `spawn --brief` / `send --file` with a missing file: `hco: can't read ...`, exit 2, no traceback.
+- `report`: a check that passed before the files changed reads `passed (N s), then files changed`.
+- `spawn` waits 100 s for `hc run`, not 180 s (Claude Code's Bash tool stops at 120 s).
+- Team: `task add --file` checks every entry (types, `for`, lengths, `after`, room under the limit) before
+  adding the first, exit 2 with the entry number; `task cancel` tells idle members (it can unblock a waiting
+  task); `tasks`/`mail` say so when a closed team's `team.json` can't be read instead of showing nothing.
+
+hcteam.py
+- `release` keeps a `--for` reservation and the releaser's next automatic `claim` skips that task (it got
+  the same task back before); it is not nudged about it either. `claim <n>` still takes it.
+- `reopen` of a task nobody held keeps its reservation.
+- Task and mail lines are cleaned of control characters and newlines when shown, not only when written.
+- `close_team` retries a version conflict on the team doc and fails if the doc stays (it reported closed).
+- `claim`: a store that kept conflicting is no longer reported as "taken by someone else"; an empty list
+  says "no task exists yet", not "every task is completed".
+
+Board mode
+- `out_dir` is checked at `init` (exit 2); a worker that can't create it fails the job with the reason
+  instead of dying with the job `running`.
+- The ten-crashes limit is no longer reset by failures the orchestrator wrote itself when requeueing.
+- Giving up (crash limit, incomplete export, failed commit, `--timeout`, archived without export) exits 1
+  as documented, not 2.
+- `init` refuses the id of an archived experiment (it overwrote that experiment's export), and checks the
+  manifest's size before writing any job doc (a refused manifest left the job docs and blocked the id).
+- A job that exits at the timeout boundary no longer kills the worker; odd `hc run` output or a hung
+  `hc run|kill|rm` no longer crashes the orchestrator; a dropped watcher retries for about 60 s.
+- `test_status_shows_timing_and_variants` could not fail; it asserts now.
+
+install.sh, docs, tests
+- install.sh compared logical paths: run from a checkout at `~/.claude/skills/hc-orchestrate` reached through
+  a symlinked `$HOME`, it deleted that checkout (reproduced). It compares physical paths now. Copy mode
+  installs only the skill's files (not `.git`, `tests/`, run state) through a temp folder; a template kept
+  for lack of `--force` is named at the end. New `tests/test_install.py`.
+- `tests/gitenv.py`: the tests ignore the global and system git config. With `commit.gpgsign=true` globally,
+  152 of 222 tests failed in `setUp`.
+- README/SKILL/hc-facts: what is live-tested, one readiness timeout (60 s on hc 0.1.20), what
+  `"complete": true` means, `--retry-failed --spec` needs a full spec, tested Python versions. CI: the
+  `unit` job has a 20 minute limit.
+
+Testing
+- Full suite as a non-root user with hc 0.1.20, with `commit.gpgsign=true` in the global git config:
+  266 tests pass, 2 skipped (the real-Claude ones); 222 before this run. The live suites
+  (`*_live.py`, scripted workers) ran; `test_hcboard_live.py` gained assertions for the `out_dir`,
+  archived-id and oversized-manifest refusals on the real core.
+- NOT live-tested: every other fix above (fake hc / fake core / mocks only), among them the watcher retry
+  against a core that really restarts.
+- Real-Claude tests (`HCO_LIVE_AGENTS=1`): NOT run. They start workers with permissions bypassed, which the
+  session that did this run was not allowed to do. The run itself used real Claude workers, but in safe
+  mode and with the skill as it was before these fixes.
+- Seen live in this run (hc 0.1.20, Claude Code 2.1.322, safe mode): workers in a worktree stopped at a
+  permission prompt when their brief named a RESULT.md in the run's main outbox, and reviewers when they
+  tried a compound shell command. SKILL.md phase 3 now says to copy inputs into the worker's own outbox.
+  `advance` still writes the earlier workers' RESULT.md paths into a brief as they are: not fixed.
+- Known and left alone: a lost reply to a won claim reads as lost (hcdoc retry), cancel after a CAS
+  give-up, a member registered only after its first message went out, a nudge lost while a member is
+  mid-turn, parallel explicit claims by one member, fakes that are more forgiving than the real hc
+  (`send --if idle` unchecked, full `ls` rows by default).
+
+## Live tests on a real hc, with scripted and real Claude workers — scripted ones pass on hc 0.1.20 in CI; real-Claude ones NOT yet run
+
+- `tests/live_support.py`: an isolated real core per test class, a git repo and a `lead` terminal per test;
+  hco runs as that lead, so workers are its real hc children.
+- `tests/test_hco_live.py` (real hc, `tests/worker_bot.py` as the worker through an hc template, no LLM):
+  spawn into a worktree -> check -> accept -> merge -> cleanup; a stray file blocking the merge; two team
+  members working a task list with a dependency and mailing each other; acting under another member's name.
+- `tests/test_hco_agents_live.py` (`HCO_LIVE_AGENTS=1`, real Claude Code): one worker from spawn to merge;
+  two team members in separate worktrees passing a word through the mailbox.
+- CI: every job installs hc 0.1.20 (checksum pinned in the workflow), so the live tests run there. A new
+  `agents` job runs the real-Claude tests on pushes and by hand when the `ANTHROPIC_API_KEY` secret exists.
+- Scripted live tests: pass in CI on hc 0.1.20 (Python 3.11-3.13, GitHub's ubuntu-latest). Three rounds of
+  fixes, all in the test bot or test, none in hco: the bot exited before hc counted it ready; with
+  `ready: quiet` a bot that prints nothing never "settles" (it now reports OSC 7501 idle/working, see
+  hc-facts); and the team test mailed a worker before hco had registered it as a member. That last one is
+  real behavior: mail to a worker spawned later is refused until its spawn finishes.
+- Not run anywhere yet: the real-Claude tests (no `ANTHROPIC_API_KEY` secret in the repository). Installing hc
+  in the session that wrote these was refused by its permission checks, so CI is where they run. The `agents` job pre-answers Claude Code's first-run dialogs with settings keys taken
+  from memory, not checked (`hasCompletedOnboarding`, `customApiKeyResponses`,
+  `bypassPermissionsModeAccepted`, `skipDangerousModePermissionPrompt`); a wrong one shows up as a worker
+  stuck on a dialog, with its screen in the failure.
+- `CLAUDE.md` records the rule: changes are tested against a real hc, and with real Claude workers when they
+  change what a worker does.
+
+## Team mode: shared task list and mail
+
+Opt-in with `hco init --team`; a run without it behaves exactly as before and never touches the doc store.
+Modelled on Claude Code's agent teams (shared task list, mailbox); README has the side-by-side table.
+
+### Added
+- `scripts/hcteam.py`, what a member runs: `claim [ID]`, `done ID --note`, `release ID --why`, `tasks`,
+  `inbox`, `send --to NAME|lead|all TEXT`, `members`. A member acts under its own name only (its
+  `$HC_TERMINAL_ID` must be the terminal `hco` started for that name) and holds one task at a time.
+- Tasks: pending, in progress, completed, cancelled; `after` (wait for other tasks) and an optional assignee.
+  Claiming is a compare-and-set on the task's doc. One doc per task and per message.
+- `hco task add|assign|reopen|cancel`, `hco tasks`, `hco mail` (reads every message, `--to NAME TEXT` sends).
+  `task add --file` takes a JSON list whose entries can depend on each other by key.
+- Mail is stored first; recipients are then told with `hc send --if idle`, so a working agent is not
+  interrupted and learns of its mail from the `mail: n unread` line under its next team command. Idle
+  members are told the same way when a task opens for them (added, assigned, reopened, unblocked).
+- `init --team` (exit 4 and nothing created when the core has no doc store); the brief of every local
+  bypass-mode worker gets a "Your team" section; `--on` and `--permissions safe` workers are not members and
+  `spawn` warns. `lead` and `all` are refused as worker names in a team run.
+- Under the `wait`/`status` table: unread mail, the task summary, and a note for a worker whose STATUS says
+  DONE while it holds a task again. `collect` lists tasks and mail. `accept` refuses a worker that holds a
+  task. `adopt` moves the lead's mailbox to the new terminal. Every message and every task change lands in
+  the journal once. `cleanup` archives to `team.json`, then deletes the docs.
+
+### Decisions
+- An earlier version of this branch had a broadcast-only "notes board" with post kinds
+  (`init --notes`, `hcnotes.py`). It is replaced by this; `send --to all` covers the broadcast.
+- Different from agent teams on purpose: the lead reads all mail, only the lead adds tasks, writers keep
+  their worktrees and scopes, and there are hard limits (100 tasks, 400 messages, 40 per worker).
+
+### Tests and limits
+- `tests/test_hcteam.py`, 22 tests against `fake_core.py` + `fake_hc.py`: four processes claiming three
+  tasks, dependencies, assignment, release, reopen, cancel, acting under another name, mail to one, to all
+  and to the lead, the nudges, author flags, the journal, an unreachable store, cleanup and its rerun.
+- Not tested: a real core, real agents, and `hc send --if idle` itself. Whether workers follow the
+  claim/done loop and keep mail short is unknown; the agent-teams docs name lagging task status as a known
+  problem. A first real run should use 2-3 workers and read `hco tasks` and `hco mail` often.
+- Task dependencies order work but do not move code: writers' worktrees only meet at `merge`.
+- `hc-orchestrate-workflow.html` does not show team mode yet.
+
 ## Board mode: fail early, cancel, retry only what failed — fake-core tests only, NOT live-tested
 
 ### Found and fixed

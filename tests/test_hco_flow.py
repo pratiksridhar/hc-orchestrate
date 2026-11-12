@@ -12,6 +12,8 @@ import time
 import unittest
 from pathlib import Path
 
+import gitenv  # noqa: F401  (git without the developer's global config)
+
 from test_hco import HCO, Base, hco
 
 

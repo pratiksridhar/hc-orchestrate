@@ -25,6 +25,11 @@ hco collect --run k3x9                  # flags files outside each worker's --sc
 - Shared types or interfaces: define them yourself first (or in a first,
   single worker), commit, then fan out from that commit (`--base <ref>`).
 - Integrate in an order where each merge still builds and passes tests.
+- Many small units instead of one job per writer, or writers that need to tell each other things:
+  create the run with `hco init --team`, spawn the writers with what they own, and put the units
+  on the task list (`hco task add ... --for <name>` where only one scope fits). Members claim,
+  complete and mail each other; you read all of it with `hco tasks` and `hco mail`. It replaces
+  neither the commit of shared types up front nor your own check of each worker.
 
 ## 2. Build → cross-vendor review loop
 

@@ -61,6 +61,34 @@ separate mode for deterministic `job_cmd` batches and touches none of this.
 - The worker retries its own failures (`failed` → `pending` while
   `attempt < max_attempts`); the orchestrator only requeues crashed owners.
 
+## Team mode (hcteam.py; fake-core tests only)
+
+A second, unrelated user of the doc store: the workers of an `hco init --team` run (LLM agents, not
+board jobs) share a task list and mail. Modelled on Claude Code's agent teams
+(code.claude.com/docs/en/agent-teams, read 2026-11-11), built on the facts above:
+
+- **Docs:** `sk-<run>-team` (members: name -> terminal, role, agent, and how far it has read the
+  mail), one doc per task `sk-<run>-t001` ... `-t100`, one per message `sk-<run>-m001` ... `-m400`.
+  New ones are created with `doc.set` at version 0 (A2): two writers that pick the same slot, one
+  gets `conflict` and takes the next.
+- **Claim** is `hcdoc`'s compare-and-set update on the task doc (pending and unassigned or assigned
+  to the claimer -> in_progress, owner set), the same mechanism as the board's job claim. Agent teams
+  use a file lock for this. "Blocked" is not stored: it is computed from `after` on every read.
+- **No listing call exists** (A6), so readers walk the slots from 1 (mail: from the reader's cursor)
+  until the first never-written one (`value: null, version: 0`, A1); a deleted slot is skipped.
+  A worker command costs the team doc, the mail after its cursor and, for task commands, every task.
+- **Delivery:** the message is stored, then the sender's process runs `hc send <terminal> "<one
+  line naming the inbox command>" --if idle` for each recipient. The text of the message is never
+  typed into a terminal. Not verified on a real hc: the exit code of `--if idle` when the target is
+  working (ignored either way) and how long it holds.
+- **Run ids repeat across repos**, and the store is one per core: `hco init --team` takes a run id
+  only if its team doc is at version 0, i.e. was never used on this core.
+- **Close:** `hco cleanup` deletes the team doc first (every command then exits 3), reads tasks and
+  mail, writes `team.json`, then deletes them. Cleanup kills the run's terminals before that; a
+  write that still lands after the read stays as a stray doc. A failed cleanup can be run again.
+- **Not covered:** workers on another machine (`doc.get` takes `on`, but the script is not there),
+  and `--permissions safe` workers (Codex's sandbox blocks the socket, see hc-facts).
+
 ## Board implementation notes (hcboard.py, docstore_worker.py)
 
 - **Files:** `scripts/hcdoc.py` (guarded doc access), `scripts/docstore_worker.py` (claims and runs jobs),
