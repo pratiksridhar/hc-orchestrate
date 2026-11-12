@@ -112,7 +112,10 @@ def run_command(argv, cwd, log_path, timeout):
             rc = CHILD.wait(timeout=timeout)
             return rc, None
         except subprocess.TimeoutExpired:
-            os.killpg(CHILD.pid, signal.SIGKILL)
+            try:
+                os.killpg(CHILD.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # the job's group exited just after the timeout
             CHILD.wait()
             return None, f"timed out after {timeout}s"
         finally:
@@ -169,13 +172,18 @@ def finish_ops(owner, attempt, rc, err, out_path, max_attempts, retry_delay_s=0)
 
 def run_job(sess, manifest, jname, job, owner):
     exp, attempt = manifest["exp"], job["attempt"]
-    out_dir = out_dir_for(manifest)
-    os.makedirs(out_dir, exist_ok=True)
+    try:  # after the claim: a crash here would leave the job `running` and cost an attempt as "worker died"
+        out_dir, bad_dir = out_dir_for(manifest), None
+        os.makedirs(out_dir, exist_ok=True)
+    except (hcdoc.BadInput, OSError) as e:
+        out_dir, bad_dir = ".", f"cannot use out_dir: {e}"
     out_path, log_path = f"{out_dir}/{jname}.json", f"{out_dir}/{jname}.log"
-    if os.path.exists(out_path):
+    if bad_dir is None and os.path.exists(out_path):
         os.remove(out_path)  # nothing from an earlier attempt may pass for this one's result
     cmd = manifest.get("job_cmd")
-    if not (isinstance(cmd, list) and cmd and all(isinstance(a, str) for a in cmd)):
+    if bad_dir is not None:
+        rc, err = 2, bad_dir
+    elif not (isinstance(cmd, list) and cmd and all(isinstance(a, str) for a in cmd)):
         rc, err = 2, "manifest job_cmd must be a non-empty list of strings"
     else:
         values = {"case": job.get("case", ""), "variant": job.get("variant", ""), "out": out_path,

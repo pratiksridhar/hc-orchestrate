@@ -184,6 +184,13 @@ class BoardLive(unittest.TestCase):
         names = {t["name"] for t in json.loads(self.hc("ls", "--all", "--json").stdout)["terminals"]}
         self.assertTrue({"bystander-done", "bystander-live"} <= names, names)
         self.hc("kill", "bystander-live")
+        # the archived id is not free again (its docs are null at version > 0 on the real core too)
+        before = (self.repo / "experiments" / f"{self.exp}.json").read_text()
+        p = self.board("init", self.exp, "--spec", self.write_spec(cases=["a"], name="again.json"), check=False)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("pick a new experiment id", p.stderr)
+        self.assertEqual((self.repo / "experiments" / f"{self.exp}.json").read_text(), before)
+        self.assert_docs_deleted()
 
     def test_crash_recovery_requeues_and_finishes(self):
         self.init(cases=["SLOW1", "a", "b", "c"], workers=2, slow=6)
@@ -305,6 +312,13 @@ class BoardLive(unittest.TestCase):
         self.assertIsNone(self.status("e98"))
         self.assertEqual(self.board("status", "nope", check=False).returncode, 2)
         self.assertEqual(self.board("pause", self.exp, check=False).returncode, 1)  # still `planned`, not running
+        self.assertEqual(self.board("init", "e97", "--spec", self.write_spec(cases=["a"], name="od.json", out_dir="../x"),
+                                    check=False).returncode, 2)  # unsafe out_dir, refused before any doc
+        self.assertIsNone(self.status("e97"))
+        big = self.write_spec(cases=["a", "b"], name="big.json", pre={"blob": "x" * 1_100_000})
+        self.assertEqual(self.board("init", "e96", "--spec", big, check=False).returncode, 2)
+        self.assertEqual(self.get_doc("sk-e96-j001"), {"value": None, "version": 0})  # no job doc left behind
+        self.board("init", "e96", "--spec", self.write_spec(cases=["a", "b"], name="small.json"))
 
 
 if __name__ == "__main__":

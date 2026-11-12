@@ -4,6 +4,8 @@ tests/fake_core.py (a file-backed doc store with events, and the few `hc` comman
 Run: python3 -I -m unittest discover -s tests -v
 The same scenarios against a real core are in test_hcboard_live.py (skipped without hc).
 """
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -14,6 +16,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = Path(os.environ.get("HCB_SCRIPTS") or HERE.parent / "scripts")  # HCB_SCRIPTS: test another copy
@@ -317,17 +320,21 @@ class Offline(unittest.TestCase):
     # ---------------------------------------------------------------- status
 
     def test_status_shows_timing_and_variants(self):
-        self.board("init", "e1", "--spec", self.spec(["a", "b", "c", "FAIL"], ["v1"], secs=0.3, max_workers=1, max_attempts=1))
+        # Nine jobs of 0.4 s on one worker: a few seconds left after the first finishes, so the checks below
+        # always see the run mid-way (they used to sit under an `if` that let a finished run pass unchecked).
+        cases = ["a", "b", "c", "d", "e", "f", "g", "h", "FAIL"]
+        self.board("init", "e1", "--spec", self.spec(cases, ["v1"], secs=0.4, max_workers=1, max_attempts=1))
         p = self.start("e1")
         self.wait_for(lambda: (self.status("e1") or {"counts": {"done": 0}})["counts"]["done"] >= 1, what="one job done")
         st = self.status("e1")
-        if st is not None and st["counts"]["pending"] + st["counts"]["running"]:  # caught it mid-run
-            self.assertGreater(st["stats"]["mean_job_s"], 0.2)
-            self.assertGreater(st["stats"]["eta_s"], 0)
-            self.assertIn("v1", st["variants"])
-            text = self.board("status", "e1", check=False).stdout
-            self.assertRegex(text, r"running for \d+s, 0\.\d+ s per finished job, about \d+s left at 1 worker\(s\) \(rough\)")
-            self.assertRegex(text, r"  v1 +done=\d failed=0 open=\d")
+        self.assertIsNotNone(st)
+        self.assertGreater(st["counts"]["pending"] + st["counts"]["running"], 0, st["counts"])
+        self.assertGreater(st["stats"]["mean_job_s"], 0.3)
+        self.assertGreater(st["stats"]["eta_s"], 0)
+        self.assertIn("v1", st["variants"])
+        text = self.board("status", "e1").stdout
+        self.assertRegex(text, r"running for \d+s, 0\.\d+ s per finished job, about \d+s left at 1 worker\(s\) \(rough\)")
+        self.assertRegex(text, r"  v1 +done=\d failed=0 open=\d")
         self.finish(p, "e1")
 
     # ---------------------------------------------------------------- hc row shapes
@@ -363,6 +370,115 @@ class Offline(unittest.TestCase):
         print(f"doc reads for {n} jobs: {gets}", file=sys.stderr) if os.environ.get("HCB_SHOW_READS") else None
         self.assertLess(gets, 16 * n, f"{gets} doc reads for {n} jobs")
         self.assertIn(f"COMPLETE done={n} failed=0", self.output("e1"))
+
+    # ---------------------------------------------------------------- review findings (B1-B11)
+
+    def hcdoc(self, *args):
+        subprocess.run([sys.executable, "-I", str(HCDOC), *args], env=self.env, check=True, capture_output=True)
+
+    def test_init_refuses_an_unsafe_out_dir(self):
+        """B1: a bad out_dir used to pass init and preflight, then crash every worker after its claim."""
+        for bad in ("../x", "/tmp/x", "a/../b"):
+            p = self.board("init", "e1", "--spec", self.spec(["A"], out_dir=bad), check=False)
+            self.assertEqual(p.returncode, 2, f"{bad}: {p.stdout}{p.stderr}")
+            self.assertIn("unsafe out_dir", p.stderr)
+        self.assertIsNone(self.status("e1"))
+
+    def test_out_dir_that_cannot_be_created_fails_the_jobs_with_the_reason(self):
+        """B1: the worker crashed on makedirs, so each job burnt its attempts as `worker tN died`."""
+        (self.repo / "blocked").write_text("a file where the out dir should be\n")
+        self.board("init", "e1", "--spec", self.spec(["A", "B"], out_dir="blocked/runs"))
+        self.assertIn("COMPLETE done=0 failed=2", self.run_board("e1"))
+        for j in self.exported("e1")["jobs"].values():
+            self.assertIn("out_dir", j["result"]["error"])
+            self.assertEqual(j["attempt"], 2)
+        self.assertNotIn("requeued", [e["event"] for e in self.events("e1")])
+
+    def test_workers_that_keep_dying_make_the_run_give_up(self):
+        """B2: the requeue that failed a crashed job counted as progress and reset the crash limit."""
+        self.board("init", "e1", "--spec", self.spec([f"c{i}" for i in range(6)], max_attempts=3,
+                                                    job_cmd=["sh", "-c", "kill -9 $PPID"]))
+        self.finish(self.start("e1"), "e1", rc=1)
+        self.assertIn("workers died with no job finishing; giving up", self.output("e1"))
+        started = [e for e in self.events("e1") if e.get("event") == "worker_started"]  # the last line is the error
+        self.assertLessEqual(len(started), 13)  # 10 crashes and the workers that were already starting, not 18
+
+    def test_giving_up_exits_1(self):
+        """B3: --timeout, a failed commit, an archived experiment without export and an incomplete export
+        exited 2 ("bad input"); the docstring and SKILL.md say 1. Start-up checks stay 2 (tested above)."""
+        self.board("init", "e1", "--spec", self.spec(["SLOW"], secs=20, max_workers=1))
+        p = self.start("e1", "--timeout", "1")
+        self.finish(p, "e1", rc=1, secs=30)
+        self.assertIn("--timeout reached", self.output("e1"))
+        for t in self.terminals():  # the worker kills its `sleep 20` on SIGHUP
+            if t["state"] == "live":
+                subprocess.run([str(FAKE), "kill", t["address"]], env=self.env, capture_output=True)
+
+        self.board("init", "e2", "--spec", self.spec(["A"]))
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        self.finish(self.start("e2"), "e2", rc=1)
+        self.assertIn("git commit failed", self.output("e2"))
+        self.assertEqual(self.status("e2")["manifest"]["state"], "done")  # docs kept
+        hook.unlink()
+        self.finish(self.start("e2"), "e2")
+
+        self.board("init", "e3", "--spec", self.spec(["A"]))
+        self.hcdoc("update", "sk-e3", "--set-str", "state=archived")
+        self.finish(self.start("e3"), "e3", rc=1)
+        self.assertIn("is archived but", self.output("e3"))
+
+        self.board("init", "e4", "--spec", self.spec(["A", "B"]))
+        self.hcdoc("delete", "sk-e4-j002", "--version", str(self.doc("sk-e4-j002")["version"]))
+        self.finish(self.start("e4"), "e4", rc=1)
+        self.assertIn("export is incomplete", self.output("e4"))
+
+    def test_init_refuses_the_id_of_an_archived_experiment(self):
+        """B4: deleted docs are null at version > 0; init took that for a free id and the new run
+        overwrote the old export."""
+        self.board("init", "e1", "--spec", self.spec(["A"]))
+        self.run_board("e1")
+        before = (self.repo / "experiments" / "e1.json").read_text()
+        self.assertGreater(self.doc("sk-e1")["version"], 0)
+        p = self.board("init", "e1", "--spec", self.spec(["B"]), check=False)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("pick a new experiment id", p.stderr)
+        self.assertIsNone(self.doc("sk-e1")["value"])
+        self.assertIsNone(self.doc("sk-e1-j001")["value"])
+        self.assertEqual((self.repo / "experiments" / "e1.json").read_text(), before)
+        self.board("init", "e2", "--spec", self.spec(["B"]), "--parent", "e1", "--delta", "{}")  # lineage still works
+        self.assertEqual(self.status("e2")["manifest"]["parent"], "e1")
+
+    def test_init_that_fails_at_the_manifest_leaves_no_job_docs(self):
+        """B6: the manifest was size-checked only after every job doc was written, blocking the id."""
+        p = self.board("init", "e1", "--spec", self.spec(["A", "B"], pre={"blob": "x" * 1_100_000}), check=False)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("bytes (limit", p.stderr)
+        self.assertEqual(self.doc("sk-e1-j001"), {"value": None, "version": 0})
+        self.board("init", "e1", "--spec", self.spec(["A", "B"]))
+
+    def test_watcher_waits_for_the_core_to_come_back(self):
+        """B8: after the watcher's connection dropped, one resubscribe 1 s later was all; if the core was
+        not back yet the orchestrator exited 4."""
+        self.board("init", "e1", "--spec", self.spec([f"c{i}" for i in range(4)], secs=1, max_workers=1))
+        p = self.start("e1")
+        self.wait_for(self.starts, what="the first job")
+
+        def watcher():
+            r = subprocess.run(["pgrep", "-P", str(p.pid), "-f", "hcdoc.py"], capture_output=True, text=True)
+            return r.stdout.split()
+
+        pid = int(self.wait_for(watcher, what="the watcher")[0])
+        (self.core / "down").write_text("")  # new connections fail; open ones keep working
+        os.kill(pid, 9)
+        time.sleep(4)
+        self.assertIsNone(p.poll(), self.output("e1")[-2000:])
+        (self.core / "down").unlink()
+        self.finish(p, "e1")
+        self.assertIn("COMPLETE done=4 failed=0", self.output("e1"))
+        self.assertIn("watch_restarted", [e["event"] for e in self.events("e1")])
 
 
 class Units(unittest.TestCase):
@@ -492,6 +608,42 @@ class Units(unittest.TestCase):
         del reads[:]
         self.assertFalse(o.reconcile())
         self.assertEqual(sorted(set(reads)), ["sk-e1"] + names)
+
+    def test_timeout_kill_survives_a_job_that_exited_just_before_it(self):
+        """B10: wait(timeout) expired, the job's group exited, then os.killpg raised ProcessLookupError."""
+        tmp = tempfile.mkdtemp(prefix="hcb")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        real = os.killpg
+
+        def racy(pid, sig):
+            real(pid, sig)  # the group is gone by the time the worker's own kill arrives
+            raise ProcessLookupError(3, "No such process")
+
+        with mock.patch.object(dw.os, "killpg", racy):
+            rc, err = dw.run_command(["sleep", "5"], tmp, os.path.join(tmp, "log"), 0.2)
+        self.assertEqual((rc, err), (None, "timed out after 0.2s"))
+
+    def test_odd_or_hung_hc_does_not_crash_the_orchestrator(self):
+        """B11: non-JSON `hc run` output or a timed-out hc raised out of reconcile."""
+        o, _ = self.orchestrator({})
+        del o.start_worker  # the real one
+        out = io.StringIO()
+
+        def hung(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        with contextlib.redirect_stdout(out):
+            with mock.patch.object(hcboard.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 0, "not json\n", "")):
+                self.assertFalse(o.start_worker([]))
+            with mock.patch.object(hcboard.subprocess, "run", hung):
+                self.assertFalse(o.start_worker([]))
+                self.assertTrue(o.cancel([{"state": "live", "address": "t1", "name": "e1-w1"}], {}))
+                o.workers = lambda: [{"state": "finished", "address": "t2"}]
+                o.remove_finished_workers()
+        events = [json.loads(line)["event"] for line in out.getvalue().splitlines()]
+        self.assertEqual(events.count("worker_start_failed"), 2, events)
+        self.assertEqual(events.count("warning"), 2, events)
 
     def test_cancel_mutation_leaves_finished_jobs_alone(self):
         v = hcboard.cancel_mutation({"state": "running", "owner": "t1", "result": {"error": None}})
