@@ -27,7 +27,7 @@ of this repo, formerly shipped as a zip).
 - `CLAUDE.md` records the rule: changes are tested against a real hc, and with real Claude workers when they
   change what a worker does.
 
-## Team mode: shared task list and mail — fake-core tests only, NOT live-tested
+## Team mode: shared task list and mail
 
 Opt-in with `hco init --team`; a run without it behaves exactly as before and never touches the doc store.
 Modelled on Claude Code's agent teams (shared task list, mailbox); README has the side-by-side table.

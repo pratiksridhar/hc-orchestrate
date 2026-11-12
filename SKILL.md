@@ -113,7 +113,7 @@ hco spawn --run <run> --name api --agent claude --role implement --worktree \
 With a stored plan, `hco advance --run <run>` replaces the `spawn` calls: it starts every
 worker whose `after` holds (up to `max_parallel`), adds the earlier workers' RESULT.md
 paths to its brief, and prints what still waits and why. Run it again after each
-`accept` or `merge`; `"complete": true` means every planned worker ran and was accepted.
+`accept` or `merge`; `"complete": true` means every planned worker ran and was accepted or merged.
 
 `spawn` wraps the body in the worker contract (scope, no sub-agents, report
 protocol, policy). Give every writer `--scope`: patterns relative to the repo root
@@ -319,7 +319,7 @@ plan table; start it only after the user approves.
 5. Verify as in phase 4: read `experiments/<exp>.json` and the job outputs under `runs/<exp>/`; a job doc
    is a claim, and failed jobs carry their error. Report failures to the user.
 6. Failed jobs, once their cause is fixed: `hcboard.py init <new-exp> --retry-failed <exp>` makes a child
-   experiment of only those jobs from the export (add `--spec` to change `job_cmd` or limits), then step 3.
+   experiment of only those jobs from the export (`--spec` replaces the parent's settings and must be a full spec: `cases`, `variants`, `job_cmd` and `question` are required, even though `cases` and `variants` are then replaced by the failed pairs), then step 3.
    Never rerun the whole grid for a few failures.
 
 Board terminals carry labels `exp=<exp>`, `role=worker`, `hco.board=<exp>`: touch only those. Details,
