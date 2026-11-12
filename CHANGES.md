@@ -5,7 +5,7 @@ of this repo, formerly shipped as a zip).
 
 ## Review run `cl4u`: bugs found by four reviewers, fixed by four writers — unit tests + scripted live tests on hc 0.1.20; the new behavior itself mostly NOT live-tested
 
-Done with the skill itself on a real hc 0.1.20: a Fable 5.2 lead, Claude Code workers on Opus 5.5 and
+Done with the skill itself on a real hc 0.1.20: a Claude Code lead, Claude Code workers on Opus 5.5 and
 Sonnet 5.5 in `--permissions safe`, four read-only reviewers, then four writers in worktrees with scopes
 and checks (`plan` + `advance`, `check`, `accept`, two follow-up rounds with `send`, `merge`). The lead read
 every finding against the code before planning and every diff before accepting.
