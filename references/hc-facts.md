@@ -1,7 +1,7 @@
 # hc facts this skill relies on
 
 Checked on 2026-11-03 against herdr-core `master` (= v0.1.17, released
-2026-11-02): the agent manual (`crates/herdr-core/src/SKILL.md`, printed by
+2026-11-02); the template readiness wait was rechecked against hc 0.1.20 (`hc --skill`): the agent manual (`crates/herdr-core/src/SKILL.md`, printed by
 `hc --skill`), `docs/commands.md` (generated from the binary's help),
 `docs/templates.md`, `schema/README.md`, and the Rust sources named below.
 If your hc is newer and disagrees, `hc --skill` and `hc <cmd> --help` win.
@@ -21,7 +21,7 @@ If your hc is newer and disagrees, `hc --skill` and `hc <cmd> --help` win.
 - Always `--bg` for agents. Run agents interactively, never in print mode
   (`claude -p`, `codex exec`): they must stay steerable.
 - **Template runs** (`hc run reviewer "task"`): core waits for the agent's
-  first OSC 7501 report (default up to 60 s, `HC_READY_MS`), then pastes
+  first OSC 7501 report (up to 60 s on hc 0.1.20, `HC_READY_MS`), then pastes
   `template body + blank line + task`. The JSON result has
   `first_message: {sent, started?, reason?, turn?}` (templates.rs).
   `sent: false` means the task did NOT go in; `hc get <t>` keeps the reason.
@@ -29,9 +29,9 @@ If your hc is newer and disagrees, `hc --skill` and `hc <cmd> --help` win.
   the agent CLI, which starts with it as its first prompt. No
   `first_message` field. Both `claude "query"` and `codex "prompt"` start an
   interactive session with that prompt.
-- Readiness (herdr-core `docs/templates.md`, read 2026-11-11): by default core waits for the program's
-  first OSC 7501 report before typing the opening message, up to 30 s, then leaves the screen alone and
-  reports `first_message.sent: false`. `ready: quiet` waits for output to settle instead; a program that
+- Readiness (hc 0.1.20: "Template launches allow up to 60 seconds for readiness"): by default core waits
+  for the program's first OSC 7501 report before typing the opening message, then leaves the screen alone
+  and reports `first_message.sent: false`. `ready: quiet` waits for output to settle instead; a program that
   prints nothing never settles (seen on hc 0.1.20 in CI: "its output never went quiet"), and one that
   exits first gets "it exited before it was ready". A scripted worker should report `state=idle` itself.
 - `--json` on `run` prints the RunResult JSON (the terminal record plus

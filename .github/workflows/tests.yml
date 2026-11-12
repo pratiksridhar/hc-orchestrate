@@ -18,6 +18,7 @@ jobs:
   unit:
     # Every test, with a real hc: the *_live.py tests run against it (scripted workers, no LLM calls).
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

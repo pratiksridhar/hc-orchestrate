@@ -350,7 +350,10 @@ terminals labeled `hco.board=<exp>`. Design, verified hc behavior and limits:
 ## Install
 
 Prerequisites: `hc` (`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`),
-Python 3.8+, git, and `claude` and/or `codex` logged in.
+Python 3, git, and `claude` and/or `codex` logged in. CI tests Python 3.11, 3.12 and 3.13; the
+scripts use only the standard library and no syntax newer than 3.8 was found, but older versions are
+untested. `--trust` for Codex edits a TOML file and needs `tomllib` (Python 3.11+); on older Python it
+only warns "--trust failed".
 
 ```sh
 sh install.sh            # copies the skill to ~/.claude/skills and ~/.agents/skills,
@@ -520,15 +523,15 @@ per job, and `experiments/<exp>.json` (manifest + every job doc, committed at th
 
 ## Known limits
 
-- Plans, checks, `accept`, `send`, `adopt`, the polling `wait` and the journal were built and
-  tested against the stand-in hc in `tests/fake_hc.py` only; no real hc was available where
-  they were written. They use `hc run --no-notify`, `hc wait <t>`, `hc get`, `hc rm` and
-  `hc send` as `references/hc-facts.md` describes them. Run the smoke test below once on your hc
-  before relying on them; see CHANGES.md for the exact assumptions.
-- Team mode (`init --team`, `hco task|tasks|mail`, `hcteam.py`) was tested against
-  `tests/fake_core.py` and `tests/fake_hc.py` only, with scripted workers. Not yet seen: a real
-  core, `hc send --if idle` as the nudge (taken from `references/hc-facts.md`), and whether real
-  agents follow the claim/done loop, mark tasks completed reliably or mail too much. The agent-teams
+- Live-tested on hc 0.1.20 with scripted workers (`tests/test_hco_live.py`, `tests/worker_bot.py`, in
+  CI): team mode (`init --team`, `hco task|tasks|mail`, `hcteam.py`), `check`, `accept` and `merge`.
+  Not live-tested: plans and `advance`, `send` (including `hc send --if idle` as the team nudge),
+  `adopt`, the polling `wait` and the journal; they were tested against the stand-in hc in
+  `tests/fake_hc.py` only and use `hc run --no-notify`, `hc wait <t>`, `hc get`, `hc rm` and `hc send`
+  as `references/hc-facts.md` describes them. Run the smoke test above once on your hc before relying
+  on them; see CHANGES.md for the exact assumptions.
+- Team mode with real agents: only the scripted workers above ran against a real core. Not yet seen:
+  whether real agents follow the claim/done loop, mark tasks completed reliably or mail too much. The agent-teams
   documentation lists "task status can lag" as a known problem there; expect it here too. Workers
   can be misled by a wrong message before the lead corrects it, and the author check is advisory (a
   bypassed worker can set its own `HC_TERMINAL_ID` or write docs directly).
