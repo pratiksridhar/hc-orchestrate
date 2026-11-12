@@ -16,6 +16,8 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
+import gitenv  # noqa: F401  (git without the developer's global config)
+
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parent / "scripts"
 HCBOARD, HCDOC = SCRIPTS / "hcboard.py", SCRIPTS / "hcdoc.py"

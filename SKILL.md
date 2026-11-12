@@ -166,6 +166,11 @@ aside (`STATUS.r1`, `RESULT.r1.md`) so the table can't show a stale `DONE`, drop
 earlier `accept`, and counts rounds: after 3 (the first task plus two follow-ups) it exits 4
 and you report to the user.
 
+Safe-mode caveat: a Claude worker in `--permissions safe` asks before it reads a file outside its
+own folder or runs a command (`blocked`, rule 3). A worktree worker can't read the run's other
+outboxes: copy what it needs (an upstream RESULT.md, review findings) into its own outbox and name
+that path, and tell it in the brief which commands it can't run.
+
 Reporting caveats: in `--permissions safe`, Codex's sandbox blocks `hc send`, so its
 reports reach you as STATUS/RESULT.md files plus hc's status events, not as messages
 (in the default bypass mode its `hc send` works); a worker with

@@ -17,6 +17,8 @@ import time
 import unittest
 from pathlib import Path
 
+import gitenv  # noqa: F401  (git without the developer's global config)
+
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parent / "scripts"
 HCO, HCTEAM, HCDOC = SCRIPTS / "hco.py", SCRIPTS / "hcteam.py", SCRIPTS / "hcdoc.py"

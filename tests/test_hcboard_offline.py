@@ -18,6 +18,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import gitenv  # noqa: F401  (git without the developer's global config)
+
 HERE = Path(__file__).resolve().parent
 SCRIPTS = Path(os.environ.get("HCB_SCRIPTS") or HERE.parent / "scripts")  # HCB_SCRIPTS: test another copy
 HCBOARD, HCDOC, FAKE = SCRIPTS / "hcboard.py", SCRIPTS / "hcdoc.py", HERE / "fake_core.py"

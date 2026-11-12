@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import gitenv  # noqa: F401  (git without the developer's global config)
+
 HERE = Path(__file__).resolve().parent
 HCO = Path(os.environ.get("HCO_SCRIPT") or HERE.parent / "scripts" / "hco.py")
 FAKE = HERE / "fake_hc.py"

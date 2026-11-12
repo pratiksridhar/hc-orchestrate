@@ -3,6 +3,85 @@
 Everything below the "Board mode" section is relative to the original skill (the initial commit
 of this repo, formerly shipped as a zip).
 
+## Review run `cl4u`: bugs found by four reviewers, fixed by four writers — unit tests + scripted live tests on hc 0.1.20; the new behavior itself mostly NOT live-tested
+
+Done with the skill itself on a real hc 0.1.20: a Fable 5.2 lead, Claude Code workers on Opus 5.5 and
+Sonnet 5.5 in `--permissions safe`, four read-only reviewers, then four writers in worktrees with scopes
+and checks (`plan` + `advance`, `check`, `accept`, two follow-up rounds with `send`, `merge`). The lead read
+every finding against the code before planning and every diff before accepting.
+
+hco.py
+- `spawn --trust`: the read-change-replace of `~/.claude.json` / `~/.codex/config.toml` now holds a lock
+  (`<file>.hco-lock`); parallel spawns no longer drop each other's trust flag.
+- `merge`: a `git merge` that fails without a conflict (an untracked file in the root would be overwritten)
+  prints `MERGE FAILED ... (not a conflict): <git's reason>` instead of an empty `CONFLICT`.
+- `merge`: a worker in a follow-up round is `NOT VERIFIED` until it reported DONE for that round and either
+  its check passed on the current files or it was accepted again. Before, a worker without a check lost
+  every gate when `send` dropped its accept.
+- `accept`: refuses when a scoped worker's changed files can't be listed (the scope was not checked).
+- `scope --add`: merges into the scope as stored now; two calls at once no longer lose a pattern.
+- `check`: no longer empties the log before its terminal started (a second `check` wiped the running
+  one's log). `spawn`/`plan` refuse a worker name that equals another worker's check terminal (`c-<name>`).
+- `advance`: no KeyError for a worker another hco spawned meanwhile; a relative `cwd` in plan.json is
+  relative to the plan file, like `brief`.
+- `spawn --brief` / `send --file` with a missing file: `hco: can't read ...`, exit 2, no traceback.
+- `report`: a check that passed before the files changed reads `passed (N s), then files changed`.
+- `spawn` waits 100 s for `hc run`, not 180 s (Claude Code's Bash tool stops at 120 s).
+- Team: `task add --file` checks every entry (types, `for`, lengths, `after`, room under the limit) before
+  adding the first, exit 2 with the entry number; `task cancel` tells idle members (it can unblock a waiting
+  task); `tasks`/`mail` say so when a closed team's `team.json` can't be read instead of showing nothing.
+
+hcteam.py
+- `release` keeps a `--for` reservation and the releaser's next automatic `claim` skips that task (it got
+  the same task back before); it is not nudged about it either. `claim <n>` still takes it.
+- `reopen` of a task nobody held keeps its reservation.
+- Task and mail lines are cleaned of control characters and newlines when shown, not only when written.
+- `close_team` retries a version conflict on the team doc and fails if the doc stays (it reported closed).
+- `claim`: a store that kept conflicting is no longer reported as "taken by someone else"; an empty list
+  says "no task exists yet", not "every task is completed".
+
+Board mode
+- `out_dir` is checked at `init` (exit 2); a worker that can't create it fails the job with the reason
+  instead of dying with the job `running`.
+- The ten-crashes limit is no longer reset by failures the orchestrator wrote itself when requeueing.
+- Giving up (crash limit, incomplete export, failed commit, `--timeout`, archived without export) exits 1
+  as documented, not 2.
+- `init` refuses the id of an archived experiment (it overwrote that experiment's export), and checks the
+  manifest's size before writing any job doc (a refused manifest left the job docs and blocked the id).
+- A job that exits at the timeout boundary no longer kills the worker; odd `hc run` output or a hung
+  `hc run|kill|rm` no longer crashes the orchestrator; a dropped watcher retries for about 60 s.
+- `test_status_shows_timing_and_variants` could not fail; it asserts now.
+
+install.sh, docs, tests
+- install.sh compared logical paths: run from a checkout at `~/.claude/skills/hc-orchestrate` reached through
+  a symlinked `$HOME`, it deleted that checkout (reproduced). It compares physical paths now. Copy mode
+  installs only the skill's files (not `.git`, `tests/`, run state) through a temp folder; a template kept
+  for lack of `--force` is named at the end. New `tests/test_install.py`.
+- `tests/gitenv.py`: the tests ignore the global and system git config. With `commit.gpgsign=true` globally,
+  152 of 222 tests failed in `setUp`.
+- README/SKILL/hc-facts: what is live-tested, one readiness timeout (60 s on hc 0.1.20), what
+  `"complete": true` means, `--retry-failed --spec` needs a full spec, tested Python versions. CI: the
+  `unit` job has a 20 minute limit.
+
+Testing
+- Full suite as a non-root user with hc 0.1.20, with `commit.gpgsign=true` in the global git config:
+  266 tests pass, 2 skipped (the real-Claude ones); 222 before this run. The live suites
+  (`*_live.py`, scripted workers) ran; `test_hcboard_live.py` gained assertions for the `out_dir`,
+  archived-id and oversized-manifest refusals on the real core.
+- NOT live-tested: every other fix above (fake hc / fake core / mocks only), among them the watcher retry
+  against a core that really restarts.
+- Real-Claude tests (`HCO_LIVE_AGENTS=1`): NOT run. They start workers with permissions bypassed, which the
+  session that did this run was not allowed to do. The run itself used real Claude workers, but in safe
+  mode and with the skill as it was before these fixes.
+- Seen live in this run (hc 0.1.20, Claude Code 2.1.322, safe mode): workers in a worktree stopped at a
+  permission prompt when their brief named a RESULT.md in the run's main outbox, and reviewers when they
+  tried a compound shell command. SKILL.md phase 3 now says to copy inputs into the worker's own outbox.
+  `advance` still writes the earlier workers' RESULT.md paths into a brief as they are: not fixed.
+- Known and left alone: a lost reply to a won claim reads as lost (hcdoc retry), cancel after a CAS
+  give-up, a member registered only after its first message went out, a nudge lost while a member is
+  mid-turn, parallel explicit claims by one member, fakes that are more forgiving than the real hc
+  (`send --if idle` unchecked, full `ls` rows by default).
+
 ## Live tests on a real hc, with scripted and real Claude workers — scripted ones pass on hc 0.1.20 in CI; real-Claude ones NOT yet run
 
 - `tests/live_support.py`: an isolated real core per test class, a git repo and a `lead` terminal per test;
