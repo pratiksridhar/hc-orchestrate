@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import hcdoc  # noqa: E402
-from docstore_worker import PLACEHOLDER, refuse_mainframe  # noqa: E402
+from docstore_worker import PLACEHOLDER, out_dir_for, refuse_mainframe  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 HC = os.environ.get("HCBOARD_HC", "hc")
@@ -50,6 +50,12 @@ FINAL = ("done", "failed")
 MANIFEST_STATES = ("planned", "running", "paused", "cancelled", "done", "archived")
 MIN_RECONCILE_GAP = 0.4  # seconds: coalesce bursts of events into one reconcile
 MAX_BAD_EXITS = 10  # workers dying with no job finishing in between => give up
+WATCH_RETRY_S = 60  # how long a dropped watcher keeps trying to resubscribe
+
+
+class GaveUp(hcdoc.Fail):
+    """The run stopped without finishing (exit 1); start-up checks stay BadInput (exit 2)."""
+    code = 1
 
 
 # ---------------------------------------------------------------- pure logic
@@ -245,6 +251,8 @@ def check_spec(spec):
         raise hcdoc.BadInput("spec.question must be a string")
     if not isinstance(spec.setdefault("pre", {}), dict):
         raise hcdoc.BadInput("spec.pre must be an object")
+    if spec.get("out_dir") is not None:
+        out_dir_for({**spec, "exp": "x"})
     return spec, cases, variants, cmd, pairs
 
 
@@ -321,6 +329,15 @@ def cmd_init(a):
         old, mver = sess.get(mname)
         if old is not None:
             raise hcdoc.BadInput(f"{mname} already exists (state {old.get('state')!r}); pick a new experiment id")
+        if mver != 0:  # deleted docs are null at a version > 0: an archived experiment had this id
+            raise hcdoc.BadInput(f"{mname} was used by an experiment that is archived; pick a new experiment id")
+        manifest = {"schema": 1, "exp": exp, "parent": parent, "delta": delta, "question": spec["question"],
+                    "pre": spec["pre"], "cases": cases, "variants": variants, "jobs": names, "job_cmd": cmd,
+                    "max_workers": spec["max_workers"], "state": "planned"}
+        for key in ("out_dir", "job_timeout_s", "retry_delay_s"):
+            if spec.get(key) is not None:
+                manifest[key] = spec[key]
+        hcdoc.check_value(manifest)  # before any job doc: a refused manifest must not leave them behind
         versions = {}
         for n in names:
             v, ver = sess.get(n)
@@ -329,12 +346,6 @@ def cmd_init(a):
             versions[n] = ver
         for n, (case, variant) in zip(names, pairs):  # job docs first, so the manifest never names a missing doc
             sess.set(n, new_job(exp, case, variant, spec["max_attempts"]), versions[n])
-        manifest = {"schema": 1, "exp": exp, "parent": parent, "delta": delta, "question": spec["question"],
-                    "pre": spec["pre"], "cases": cases, "variants": variants, "jobs": names, "job_cmd": cmd,
-                    "max_workers": spec["max_workers"], "state": "planned"}
-        for key in ("out_dir", "job_timeout_s", "retry_delay_s"):
-            if spec.get(key) is not None:
-                manifest[key] = spec[key]
         try:
             sess.set(mname, manifest, mver)
         except hcdoc.Conflict as e:
@@ -428,6 +439,8 @@ class Orchestrator:
         self.last_counts = None
         self.seen_bad = set()  # finished workers already counted as crashes
         self.bad_exits = 0
+        self.failed_here = 0  # jobs this orchestrator failed itself (crashed owner on its last attempt, exhausted)
+        self.last_progress = 0
         self.children = set()
         self.worker_py = str(HERE / "docstore_worker.py")
         self.jobs = None  # last value read of every job doc
@@ -451,6 +464,19 @@ class Orchestrator:
                 return
         self.stop_watch()
         raise hcdoc.Down("could not subscribe to core events")
+
+    def restart_watch(self):
+        """Resubscribe after the watcher died, waiting 1, 2, 4, 8, 10, 10 ... s between tries for about
+        WATCH_RETRY_S in all (a core that restarts is not back at once), then give up with Down."""
+        delay, end = 1, time.monotonic() + WATCH_RETRY_S
+        while True:
+            time.sleep(delay)
+            try:
+                return self.start_watch()
+            except hcdoc.Down:
+                if time.monotonic() + delay > end:
+                    raise
+                delay = min(delay * 2, 10)
 
     def stop_watch(self):
         if self.watch:
@@ -507,15 +533,24 @@ class Orchestrator:
 
     def start_worker(self, terms):
         name = self.next_worker_name(terms)
-        r = subprocess.run(
-            [HC, "run", "--bg", "--json", "--outlive-parent", "--no-notify", "--name", name,
-             "--label", f"exp={self.exp}", "--label", "role=worker", "--label", f"hco.board={self.exp}",
-             "--cwd", self.cwd, "--", sys.executable, self.worker_py, self.exp],
-            capture_output=True, text=True, timeout=60)
+        try:
+            r = subprocess.run(
+                [HC, "run", "--bg", "--json", "--outlive-parent", "--no-notify", "--name", name,
+                 "--label", f"exp={self.exp}", "--label", "role=worker", "--label", f"hco.board={self.exp}",
+                 "--cwd", self.cwd, "--", sys.executable, self.worker_py, self.exp],
+                capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            emit("worker_start_failed", name=name, error="hc run timed out after 60 s")
+            return False
         if r.returncode != 0:
             emit("worker_start_failed", name=name, error=(r.stdout + r.stderr).strip()[:200])
             return False
-        emit("worker_started", name=name, terminal=json.loads(r.stdout).get("address"))
+        try:
+            address = json.loads(r.stdout).get("address")
+        except (ValueError, AttributeError):
+            emit("worker_start_failed", name=name, error=f"hc run printed non-JSON: {r.stdout.strip()[:200]}")
+            return False
+        emit("worker_started", name=name, terminal=address)
         terms.append({"name": name})
         return True
 
@@ -541,6 +576,7 @@ class Orchestrator:
             try:
                 _, jobs[n] = self.sess.update(n, lambda d, ops=ops: hcdoc.apply_ops(d, ops))
                 emit("requeued", job=n, owner=v["owner"], attempt=v["attempt"], to=jobs[n]["state"])
+                self.failed_here += jobs[n]["state"] == "failed"
             except hcdoc.Lost:
                 jobs[n] = self.sess.get(n)[0]  # it moved on while we looked
         for n, v in exhausted(jobs):
@@ -548,18 +584,20 @@ class Orchestrator:
                    ("set", "result.error", "attempts exhausted"), ("now", "finished_ms", None)]
             try:
                 _, jobs[n] = self.sess.update(n, lambda d, ops=ops: hcdoc.apply_ops(d, ops))
+                self.failed_here += 1
             except hcdoc.Lost:
                 jobs[n] = self.sess.get(n)[0]
         c = counts(jobs)
         if c != self.last_counts:
-            if self.last_counts and c["done"] + c["failed"] > self.last_counts["done"] + self.last_counts["failed"]:
+            progress = c["done"] + c["failed"] - self.failed_here  # failures we wrote ourselves are no progress
+            if self.last_counts and progress > self.last_progress:
                 self.bad_exits = 0  # progress: earlier crashes were not systematic
             emit("progress", **c)
-            self.last_counts = c
+            self.last_counts, self.last_progress = c, progress
         if c["missing"]:
             emit("warning", message=f"{c['missing']} job doc(s) missing", jobs=[n for n, v in jobs.items() if v is None])
         if self.bad_exits >= MAX_BAD_EXITS:
-            raise hcdoc.Fail(f"{self.bad_exits} workers died with no job finishing; giving up (see `hc read` on a worker)")
+            raise GaveUp(f"{self.bad_exits} workers died with no job finishing; giving up (see `hc read` on a worker)")
         if c["pending"] + c["running"] == 0:
             if self.reads < len(jobs):  # concluded from cached docs: confirm with a full read before finishing
                 self.full = True
@@ -596,7 +634,11 @@ class Orchestrator:
         group on SIGHUP), fail every job that has not finished, and let finalize export and archive."""
         for t in terms:
             if t.get("state") == "live":
-                subprocess.run([HC, "kill", t["address"]], capture_output=True, timeout=60)
+                try:
+                    subprocess.run([HC, "kill", t["address"]], capture_output=True, timeout=60)
+                except subprocess.TimeoutExpired:
+                    emit("warning", message=f"hc kill {t['address']} timed out after 60 s")
+                    continue
                 emit("worker_killed", terminal=t["address"], name=t.get("name"))
         n = 0
         for name, v in jobs.items():
@@ -646,7 +688,7 @@ class Orchestrator:
         out = os.path.join(self.cwd, "experiments", f"{self.exp}.json")
         res = self.sess.export(self.exp, out)
         if res["missing"] or res["jobs"] != len(manifest.get("jobs") or []):
-            raise hcdoc.Fail(f"export is incomplete ({res}); docs kept")
+            raise GaveUp(f"export is incomplete ({res}); docs kept")
         emit("exported", **res)
         if self.commit:
             self.git_commit(out)
@@ -672,7 +714,7 @@ class Orchestrator:
         for args in (["add", "--", rel], ["commit", "-m", f"board: export experiment {self.exp}", "--", rel]):
             r = subprocess.run(["git", "-C", self.cwd, *args], capture_output=True, text=True)
             if r.returncode != 0:
-                raise hcdoc.Fail(f"git {args[0]} failed ({(r.stdout + r.stderr).strip()[:200]}); docs kept, "
+                raise GaveUp(f"git {args[0]} failed ({(r.stdout + r.stderr).strip()[:200]}); docs kept, "
                                  f"fix and rerun `hcboard.py run {self.exp}` (or --no-commit)")
         emit("committed", path=rel)
 
@@ -689,7 +731,11 @@ class Orchestrator:
         n = 0
         for t in self.workers():
             if t.get("state") == "finished":  # only our own labeled terminals come back from this query
-                subprocess.run([HC, "rm", t["address"]], capture_output=True, timeout=60)
+                try:
+                    subprocess.run([HC, "rm", t["address"]], capture_output=True, timeout=60)
+                except subprocess.TimeoutExpired:
+                    emit("warning", message=f"hc rm {t['address']} timed out after 60 s")
+                    continue
                 n += 1
         return n
 
@@ -710,8 +756,7 @@ class Orchestrator:
                 m = self.lines.next(0.5) if self.lines else False
                 if m is False:  # watcher died (core restart, dropped connection): resubscribe, then reconcile
                     emit("watch_restarted")
-                    time.sleep(1)
-                    self.start_watch()
+                    self.restart_watch()
                     self.dirty = self.full = True
                 elif m:
                     self.on_message(m)
@@ -723,7 +768,7 @@ class Orchestrator:
                     if self.reconcile():
                         break
                 if self.deadline and now > self.deadline:
-                    raise hcdoc.Fail("--timeout reached; experiment left in place, rerun to continue")
+                    raise GaveUp("--timeout reached; experiment left in place, rerun to continue")
         finally:
             self.stop_watch()
         return self.finalize()
@@ -731,7 +776,7 @@ class Orchestrator:
     def resume_archived(self, mname, manifest):
         out = os.path.join(self.cwd, "experiments", f"{self.exp}.json")
         if not os.path.exists(out):
-            raise hcdoc.Fail(f"{mname} is archived but {out} is missing; not deleting anything")
+            raise GaveUp(f"{mname} is archived but {out} is missing; not deleting anything")
         self.delete_docs(mname, manifest)
         emit("archived", resumed=True, out=out)
         return hcdoc.OK
