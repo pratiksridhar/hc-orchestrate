@@ -92,6 +92,12 @@ def one_line(text, limit, what):
     return text
 
 
+def clean(text):
+    """For display: what one_line makes of text, but never refusing (empty stays empty, no limit)."""
+    text = "".join(c if c.isprintable() or c.isspace() else " " for c in str(text if text is not None else ""))
+    return " ".join(text.split())
+
+
 def block(text, limit, what):
     """Several lines allowed; control characters other than newline and tab dropped."""
     text = "".join(c if c.isprintable() or c in "\n\t" else " " for c in str(text or "")).strip()
@@ -206,9 +212,10 @@ def waiting_for(task: dict, by_n: dict):
     return [d for d in task.get("after") or [] if by_n.get(d, {}).get("state") not in (COMPLETED, CANCELLED)]
 
 
-def claimable(task: dict, by_n: dict, name: str) -> bool:
+def claimable(task: dict, by_n: dict, name: str, auto=False) -> bool:
+    """auto: for the pick of the next task, which skips what `name` released itself."""
     return (task.get("state") == OPEN and task.get("assignee") in (None, name)
-            and not waiting_for(task, by_n))
+            and not waiting_for(task, by_n) and not (auto and task.get("released_by") == name))
 
 
 def add_task(s, run: str, title, detail=None, after=None, assignee=None, by=LEAD) -> dict:
@@ -247,7 +254,7 @@ def claim(s, run: str, name: str, term, n=None) -> dict:
         by_n = {t["n"]: t for t in allt}
         mine = [t for t in allt if t.get("state") == BUSY and t.get("owner") == name]
         if mine:
-            raise Refused(f"you already hold task #{mine[0]['n']} ({mine[0]['title']}): finish it with `done` or "
+            raise Refused(f"you already hold task #{mine[0]['n']} ({clean(mine[0]['title'])}): finish it with `done` or "
                           "give it back with `release` first")
         if n is not None:
             t = by_n.get(n)
@@ -257,14 +264,15 @@ def claim(s, run: str, name: str, term, n=None) -> dict:
                 raise Refused(f"task #{n} can't be claimed: {why_not(t, by_n, name)}")
             pick = t
         else:
-            pick = next((t for t in allt if claimable(t, by_n, name)), None)
+            pick = next((t for t in allt if claimable(t, by_n, name, auto=True)), None)
             if pick is None:
                 raise Refused(nothing_left(allt, by_n, name))
 
         def mutate(v):
             if v.get("state") != OPEN or v.get("assignee") not in (None, name):
                 raise hcdoc.Lost("taken")
-            v.update(state=BUSY, owner=name, owner_term=term, claimed_ms=hcdoc.now_ms(), note=None)
+            v.update(state=BUSY, owner=name, owner_term=term, claimed_ms=hcdoc.now_ms(), note=None,
+                     released_by=None)
             return v
         try:
             return change_task(s, run, pick["n"], mutate)
@@ -272,6 +280,10 @@ def claim(s, run: str, name: str, term, n=None) -> dict:
             raise
         except hcdoc.Lost:
             if n is not None:
+                now, _ = s.get(slot_name(run, "t", n))
+                if isinstance(now, dict) and now.get("state") == OPEN and now.get("assignee") in (None, name):
+                    raise Refused(f"task #{n} could not be claimed: the store kept reporting conflicting writes. "
+                                  "Nobody holds it; try again")
                 raise Refused(f"task #{n} was taken by someone else just now")
             continue  # someone else got it: look for the next one
     raise Refused("no task could be claimed")
@@ -279,18 +291,26 @@ def claim(s, run: str, name: str, term, n=None) -> dict:
 
 def why_not(t, by_n, name) -> str:
     if t.get("state") == BUSY:
-        return f"{t.get('owner')} is working on it"
+        return f"{clean(t.get('owner'))} is working on it"
     if t.get("state") in (COMPLETED, CANCELLED):
         return f"it is {t['state']}"
     if t.get("assignee") not in (None, name):
-        return f"it is assigned to {t['assignee']}"
+        return f"it is assigned to {clean(t['assignee'])}"
+    if not waiting_for(t, by_n) and t.get("released_by") == name:
+        return "you released it; only an explicit claim takes it again"
     return "it waits for task(s) " + ", ".join(f"#{d}" for d in waiting_for(t, by_n))
 
 
 def nothing_left(allt, by_n, name) -> str:
     left = [t for t in allt if t.get("state") in (OPEN, BUSY)]
+    if not allt:
+        return "no task exists yet: the lead will add them. Report to your lead as your BRIEF.md says."
     if not left:
-        return "no task left: every task is completed. Report to your lead as your BRIEF.md says."
+        cancelled = sum(1 for t in allt if t.get("state") == CANCELLED)
+        if cancelled == len(allt):
+            return "no task left: every task is cancelled. Report to your lead as your BRIEF.md says."
+        return ("no task left: every task is completed" + (f" ({cancelled} cancelled)" if cancelled else "")
+                + ". Report to your lead as your BRIEF.md says.")
     return ("no task you can take right now. Still open: "
             + "; ".join(f"#{t['n']} ({why_not(t, by_n, name)})" for t in left)
             + ". Do not wait for them: report to your lead as your BRIEF.md says.")
@@ -308,7 +328,7 @@ def finish(s, run: str, name: str, term, n: int, note, state=COMPLETED) -> dict:
         if state == COMPLETED:
             v.update(state=COMPLETED, note=note, done_ms=hcdoc.now_ms())
         else:
-            v.update(state=OPEN, owner=None, owner_term=None, assignee=None, note=f"released by {name}: {note}")
+            v.update(state=OPEN, owner=None, owner_term=None, released_by=name, note=f"released by {name}: {note}")
         return v
     return change_task(s, run, n, mutate)
 
@@ -326,13 +346,14 @@ def lead_change(s, run: str, n: int, action: str, assignee=None, why=None) -> di
         if action == "assign":
             if st != OPEN:
                 raise Refused(f"task #{n} is {st}; only a pending task can be assigned (reopen it first)")
-            v["assignee"] = assignee
+            v.update(assignee=assignee, released_by=None)
         elif action == "reopen":
             if st not in (COMPLETED, BUSY, CANCELLED):
                 raise Refused(f"task #{n} is already pending")
             if not why:
                 raise hcdoc.BadInput("reopen needs --why: what is wrong or missing")
-            v.update(state=OPEN, assignee=assignee or v.get("owner"), owner=None, owner_term=None,
+            v.update(state=OPEN, assignee=assignee or v.get("owner") or v.get("assignee"), released_by=None,
+                     owner=None, owner_term=None,
                      note=f"reopened by the lead: {why}")
         elif action == "cancel":
             if st == CANCELLED:
@@ -346,8 +367,9 @@ def task_line(t, by_n) -> str:
     st = t.get("state")
     if st == OPEN and waiting_for(t, by_n):
         st = "blocked (waits for " + ", ".join(f"#{d}" for d in waiting_for(t, by_n)) + ")"
-    who = t.get("owner") or (f"for {t['assignee']}" if t.get("assignee") else "anyone" if t.get("state") == OPEN else "-")
-    return f"#{t['n']:<3} {st:<12} {who:<14} {t.get('title', '')}" + (f"\n       note: {t['note']}" if t.get("note") else "")
+    who = clean(t.get("owner")) or (f"for {clean(t['assignee'])}" if t.get("assignee") else "anyone" if t.get("state") == OPEN else "-")
+    return (f"#{t['n']:<3} {st:<12} {who:<14} {clean(t.get('title', ''))}"
+            + (f"\n       note: {clean(t['note'])}" if t.get("note") else ""))
 
 
 def task_summary(allt, by_n=None) -> str:
@@ -406,7 +428,8 @@ def unread_count(s, run: str, team: dict, name: str) -> int:
 
 def mail_line(m: dict) -> str:
     when = time.strftime("%H:%M", time.localtime(m["ms"] / 1000)) if isinstance(m.get("ms"), int) else "--:--"
-    return f"#{m.get('n')} {m.get('from', '?')} -> {m.get('to', '?')} [{m.get('term') or 'no terminal id'}] {when}  {m.get('text', '')}"
+    return (f"#{clean(m.get('n'))} {clean(m.get('from', '?'))} -> {clean(m.get('to', '?'))} "
+            f"[{clean(m.get('term')) or 'no terminal id'}] {when}  {clean(m.get('text', ''))}")
 
 
 def nudge(members: dict, texts: dict, timeout=20):
@@ -451,7 +474,7 @@ def nudge_tasks(run: str, members: dict, allt, skip=()):
     for name in members:
         if name == LEAD or name in skip or any(t.get("state") == BUSY and t.get("owner") == name for t in allt):
             continue
-        if any(claimable(t, by_n, name) for t in allt):
+        if any(claimable(t, by_n, name, auto=True) for t in allt):
             texts[name] = f"[hco team {run}] a task is open for you. Take it with: {self_cmd(run, name, 'claim')}"
     nudge(members, texts)
     return sorted(texts)
@@ -465,12 +488,19 @@ def close_team(s, run: str, archive=None) -> dict:
     message, hand them to archive(dict) and only then delete them. Returns what was there. Safe to run
     again after a failure: `team` is then None and the lists hold what was still left."""
     name = team_name(run)
-    team, version = s.get(name)
-    if team is not None:
+    team = None
+    for _ in range(5):
+        now, version = s.get(name)
+        if now is None:
+            break
+        team = now
         try:
             s.set(name, None, version)
-        except hcdoc.Conflict:
+            break
+        except hcdoc.Conflict:  # a cursor or member update came in between: read again
             pass
+    else:
+        raise Refused(f"could not delete the team doc {name}: it kept changing. Run cleanup again")
     found = {"tasks": scan(s, run, "t", MAX_TASKS)[0], "mail": scan(s, run, "m", MAX_MAIL)[0]}
     out = {"team": team, **{k: [v for _, v, _ in rows] for k, rows in found.items()}}
     if archive:
@@ -539,7 +569,7 @@ def main(argv=None):
                     print(task_line(t, by_n))
         elif a.cmd == "claim":
             t = claim(s, a.run, a.name, term, a.id)
-            print(f"task #{t['n']} is yours: {t['title']}")
+            print(f"task #{t['n']} is yours: {clean(t['title'])}")
             if t.get("detail"):
                 print(t["detail"])
             print(f"When it is finished: {self_cmd(a.run, a.name, 'done')} {t['n']} --note \"<what you did, how you checked it>\"")
@@ -549,8 +579,9 @@ def main(argv=None):
             print(f"task #{a.id} completed ({task_summary(allt)}). Next: {self_cmd(a.run, a.name, 'claim')}")
             nudge_tasks(a.run, get_team(s, a.run)["members"], allt, skip=(a.name,))
         elif a.cmd == "release":
-            finish(s, a.run, a.name, term, a.id, a.why, state=OPEN)
-            print(f"task #{a.id} is pending again, for anyone. Next: {self_cmd(a.run, a.name, 'claim')}")
+            t = finish(s, a.run, a.name, term, a.id, a.why, state=OPEN)
+            print(f"task #{a.id} is pending again, " + (f"kept for {clean(t['assignee'])}" if t.get("assignee") else "for anyone")
+                  + f". Next: {self_cmd(a.run, a.name, 'claim')}")
             nudge_tasks(a.run, get_team(s, a.run)["members"], tasks(s, a.run), skip=(a.name,))
         elif a.cmd == "inbox":
             msgs = inbox(s, a.run, a.name, term)

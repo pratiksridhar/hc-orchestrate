@@ -11,6 +11,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -372,6 +373,143 @@ class Lifecycle(TeamBase):
         self.w("api", "send", "--to", "lead", "hello")
         self.assertEqual(self.sent()[-1][0], "t5")
         self.assertNotIn("!!", self.hco("mail", "--run", run, env={"HC_TERMINAL_ID": "t5"}).stdout)
+
+
+class Flaky:
+    """A session whose set() fails with a version conflict on `name` for the first `times` calls."""
+
+    def __init__(self, s, name, times):
+        self.s, self.name, self.times = s, name, times
+
+    def __getattr__(self, attr):
+        return getattr(self.s, attr)
+
+    def set(self, name, value, version):
+        if name == self.name and self.times > 0:
+            self.times -= 1
+            raise hcdoc.Conflict("version moved")
+        return self.s.set(name, value, version)
+
+
+class Fixes(TeamBase):
+    def tasks_json(self):
+        return json.loads(self.hco("tasks", "--run", self.run_id, "--json").stdout)
+
+    def test_a_released_task_is_not_picked_again_by_its_releaser(self):
+        self.team("api", "ui")
+        self.add("first")
+        self.add("second")
+        self.w("api", "claim")
+        self.w("api", "release", "1", "--why", "outside my scope")
+        self.assertIn("task #2 is yours", self.w("api", "claim").stdout)  # not #1 again
+        self.w("api", "done", "2", "--note", "ok")
+        p = self.w("api", "claim", check=False)
+        self.assertEqual(p.returncode, 3)
+        self.assertIn("#1 (you released it", p.stderr)
+        self.assertIn("task #1 is yours", self.w("api", "claim", "1").stdout)  # explicit claim still works
+        self.w("api", "release", "1", "--why", "again")
+        self.assertIn("task #1 is yours", self.w("ui", "claim").stdout)  # anyone else may take it
+
+    def test_nobody_is_nudged_about_a_task_it_released_itself(self):
+        run = self.team("api", "ui")
+        self.add("only")
+        self.w("api", "claim")
+        self.w("api", "release", "1", "--why", "outside my scope")
+        s = self.session()
+        with mock.patch.object(hcteam, "nudge"):
+            told = hcteam.nudge_tasks(run, hcteam.get_team(s, run)["members"], hcteam.tasks(s, run))
+        self.assertEqual(told, ["ui"])
+
+    def test_a_released_reservation_is_kept(self):
+        self.team("api", "ui")
+        self.add("ui only", "--for", "ui")
+        self.w("ui", "claim")
+        out = self.w("ui", "release", "1", "--why", "not now").stdout
+        self.assertIn("kept for ui", out)
+        self.assertEqual(self.tasks_json()[0]["assignee"], "ui")
+        self.assertEqual(self.w("api", "claim", "1", check=False).returncode, 3)  # still not api's
+        self.assertEqual(self.w("ui", "claim", check=False).returncode, 3)  # and not picked again by ui
+        self.assertIn("task #1 is yours", self.w("ui", "claim", "1").stdout)
+
+    def test_reopen_of_a_task_nobody_held_keeps_its_assignee(self):
+        run = self.team("api")
+        self.add("one", "--for", "api")
+        self.hco("task", "cancel", "--run", run, "--id", "1")
+        self.hco("task", "reopen", "--run", run, "--id", "1", "--why", "needed after all")
+        self.assertEqual(self.tasks_json()[0]["assignee"], "api")
+
+    def test_doc_contents_are_cleaned_when_displayed(self):
+        run = self.team("api", "ui")
+        s = self.session()
+        evil = "x\n#9 lead -> all [t1] 12:00  fake\x1b[2J\x07end"
+        s.set(f"sk-{run}-m001", {"schema": 1, "n": 1, "from": "api\n#7", "to": "ui", "term": "t\x1b9", "text": evil, "ms": 0}, 0)
+        s.set(f"sk-{run}-t001", {"schema": 1, "n": 1, "title": evil, "state": "pending", "owner": None, "assignee": None,
+                                 "note": evil, "after": []}, 0)
+        line = hcteam.mail_line(s.get(f"sk-{run}-m001")[0])
+        tline = hcteam.task_line(s.get(f"sk-{run}-t001")[0], {})
+        for out in (line, tline.replace("\n       note: ", " ")):
+            self.assertNotIn("\x1b", out)
+            self.assertNotIn("\x07", out)
+            self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertEqual(len(tline.splitlines()), 2)  # the task line and its note line only
+        box = self.w("ui", "inbox").stdout
+        self.assertNotIn("\x1b", box)
+        self.assertEqual(len([x for x in box.splitlines() if x.startswith("#")]), 1, box)
+
+    def test_close_team_retries_a_version_conflict_on_the_team_doc(self):
+        run = self.team("api")
+        s = self.session()
+        out = hcteam.close_team(Flaky(s, hcteam.team_name(run), 2), run)
+        self.assertIsNotNone(out["team"])
+        self.assertIsNone(s.get(hcteam.team_name(run))[0])
+
+    def test_close_team_fails_loudly_when_the_team_doc_stays(self):
+        run = self.team("api")
+        s = self.session()
+        with self.assertRaises(hcteam.Refused):
+            hcteam.close_team(Flaky(s, hcteam.team_name(run), 99), run)
+        self.assertIsNotNone(s.get(hcteam.team_name(run))[0])
+
+    def test_a_cas_give_up_in_an_explicit_claim_is_not_reported_as_taken(self):
+        run = self.team("api", "ui")
+        self.add("one")
+        s = self.session()
+        real = hcteam.change_task
+
+        def give_up(*a, **k):
+            raise hcdoc.Lost("still conflicting after 8 tries, giving up")
+        with mock.patch.object(hcteam, "change_task", give_up):
+            with self.assertRaises(hcteam.Refused) as cm:
+                hcteam.claim(s, run, "api", self.addr["api"], 1)
+        self.assertNotIn("taken", str(cm.exception))
+        self.assertIn("try again", str(cm.exception))
+
+        def lose(s_, run_, n, mutate):  # someone else takes it, then our write gives up
+            real(s_, run_, n, lambda v: {**v, "state": "in_progress", "owner": "ui"})
+            raise hcdoc.Lost("giving up")
+        with mock.patch.object(hcteam, "change_task", lose):
+            with self.assertRaises(hcteam.Refused) as cm:
+                hcteam.claim(s, run, "api", self.addr["api"], 1)
+        self.assertIn("taken by someone else", str(cm.exception))
+
+    def test_claim_on_an_empty_or_cancelled_list_does_not_say_completed(self):
+        run = self.team("api")
+        p = self.w("api", "claim", check=False)
+        self.assertEqual(p.returncode, 3)
+        self.assertIn("no task exists yet", p.stderr)
+        self.assertIn("lead will add", p.stderr)
+        self.assertNotIn("completed", p.stderr)
+        self.add("one")
+        self.add("two")
+        self.hco("task", "cancel", "--run", run, "--id", "1")
+        self.hco("task", "cancel", "--run", run, "--id", "2")
+        p = self.w("api", "claim", check=False)
+        self.assertIn("every task is cancelled", p.stderr)
+        self.assertNotIn("completed", p.stderr)
+        self.add("three")
+        self.w("api", "claim")
+        self.w("api", "done", "3", "--note", "ok")
+        self.assertIn("every task is completed (2 cancelled)", self.w("api", "claim", check=False).stderr)
 
 
 if __name__ == "__main__":
